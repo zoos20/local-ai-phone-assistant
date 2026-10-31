@@ -212,3 +212,7 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
   вслух.
 - Озвучка и остановка во время произношения управляются с телефона;
   барж-ин (перебивание) намеренно не реализован.
+
+## Лицензия
+
+Apache License 2.0 — см. [LICENSE](LICENSE).
