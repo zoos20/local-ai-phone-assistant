@@ -56,6 +56,7 @@
 android/                клиент-приложение (Kotlin, foreground service)
 scripts/                скрипты запуска/настройки (PowerShell):
   start-all.ps1           автозапуск стека (llama-server + server.py)
+  stop-all.ps1            остановка всего стека (8080/8090/8091, есть -WhatIf)
   start-kokoro.ps1        запуск TTS-sidecar
   setup-firewall.ps1      разовый: правило фаервола для порта 8090 (админ)
   setup-adb.ps1           разовый: ADB-интерфейс телефона + фаервол (админ)
@@ -124,6 +125,9 @@ powershell -File ..\scripts\start-kokoro.ps1   # TTS на 8091 (нужен .venv
 
 # Проверка:
 curl http://127.0.0.1:8090/health
+
+# Остановка всего стека (llama + API + kokoro; -WhatIf — «показать, не трогая»):
+powershell -ExecutionPolicy Bypass -File scripts\stop-all.ps1
 ```
 
 Разовый сетевой доступ (от имени администратора):
