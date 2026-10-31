@@ -49,27 +49,34 @@
 
 ## Структура проекта
 
+В корне репозитория — только `README.md`, `LICENSE` и `.gitignore`; весь код
+разложен по каталогам:
+
 ```
-server.py               FastAPI: /ask /voice /ws_voice /tts /confirm /profile /health
-llm.py                  промпт, профили (характер ↔ голос ↔ пол), стриминг
-                        ответа (chat_stream/decide_stream) от llama-server
-stt.py                  распознавание речи (faster-whisper, CPU, int8)
-tts.py                  озвучка: kokoro-ru через sidecar, фолбэк Piper
-tts_kokoro_server.py    sidecar kokoro-ru на 8091 (отдельное окружение .venv-tts)
-tools.py                действия: поиск, Telegram, VK, звонки
-config.py               настройки из .env (префикс ASSISTANT_)
-login_tg.py             разовый вход в Telegram (Telethon user session)
+android/                клиент-приложение (Kotlin, foreground service)
 scripts/                скрипты запуска/настройки (PowerShell):
   start-all.ps1           автозапуск стека (llama-server + server.py)
   start-kokoro.ps1        запуск TTS-sidecar
   setup-firewall.ps1      разовый: правило фаервола для порта 8090 (админ)
   setup-adb.ps1           разовый: ADB-интерфейс телефона + фаервол (админ)
-android/                клиент-приложение (Kotlin, foreground service)
-models/                 голоса Piper (*.onnx) — не в репозитории
+server/                 Python-часть (здесь же .env, окружения, models/):
+  server.py               FastAPI: /ask /voice /ws_voice /tts /confirm /profile /health
+  llm.py                  промпт, профили (характер ↔ голос ↔ пол), стриминг
+                          ответа (chat_stream/decide_stream) от llama-server
+  stt.py                  распознавание речи (faster-whisper, CPU, int8)
+  tts.py                  озвучка: kokoro-ru через sidecar, фолбэк Piper
+  tts_kokoro_server.py    sidecar kokoro-ru на 8091 (отдельное окружение .venv-tts)
+  tools.py                действия: поиск, Telegram, VK, звонки
+  config.py               настройки из .env (префикс ASSISTANT_)
+  login_tg.py             разовый вход в Telegram (Telethon user session)
+  requirements.txt        зависимости основного окружения
+  .env.example            шаблон настроек
+models/                 голоса Piper (*.onnx) внутри server/ — не в репозитории
 ```
 
-Python-модули намеренно лежат в корне (плоские импорты `import llm` и пути
-`Path(__file__).parent` для `.env`/моделей/данных).
+Python-модули лежат плоско внутри `server/` (плоские импорты `import llm`
+и пути `Path(__file__).parent` для `.env`/моделей/данных), поэтому
+`.env`, окружения `.venv`/`.venv-tts` и каталог `models/` создаются там же.
 
 ## Требования
 
@@ -81,8 +88,8 @@ Python-модули намеренно лежат в корне (плоские 
 ## Установка сервера
 
 ```powershell
-# 1. Клонировать репозиторий и перейти в каталог
-cd <каталог-проекта>
+# 1. Клонировать репозиторий и перейти в каталог Python-части
+cd <каталог-проекта>\server
 
 # 2. Основное окружение
 python -m venv .venv
@@ -90,7 +97,7 @@ python -m venv .venv
 
 # 3. Окружение для TTS-sidecar (kokoro-ru)
 python -m venv .venv-tts
-.venv-tts\Scripts\pip install kokoro phonopy pyyaml  # см. start-kokoro.ps1
+.venv-tts\Scripts\pip install kokoro phonopy pyyaml  # см. scripts\start-kokoro.ps1
 
 # 4. Голоса Piper (фолбэк озвучки)
 .venv\Scripts\python -m piper.download_voices ru_RU-denis-medium --data-dir models
@@ -106,13 +113,14 @@ copy .env.example .env     # заполнить (см. «Настройка .env
 ## Запуск
 
 ```powershell
-# Весь стек сразу (llama-server + API):
+# Весь стек сразу (llama-server + API) — из любого каталога:
 powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 # Или по частям:
 <путь-к-llama-server>                      # LLM на 8080
+cd server
 .venv\Scripts\python server.py             # API на 8090
-powershell -File scripts\start-kokoro.ps1  # TTS на 8091 (нужен .venv-tts)
+powershell -File ..\scripts\start-kokoro.ps1   # TTS на 8091 (нужен .venv-tts)
 
 # Проверка:
 curl http://127.0.0.1:8090/health
@@ -126,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-firewall.ps1   # порт
 
 ## Настройка .env
 
-Скопируйте `.env.example` в `.env` и заполните:
+Скопируйте `server\.env.example` в `server\.env` и заполните:
 
 | Ключ | Назначение |
 |---|---|
@@ -147,6 +155,7 @@ Telegram и VK работают **необязательно**: при пуст�
 Один раз войти в Telegram (нужен заполненный `ASSISTANT_TG_API_ID/HASH`):
 
 ```powershell
+cd server
 .venv\Scripts\python login_tg.py
 ```
 

@@ -4,7 +4,10 @@
 
     Starts BOTH servers, idempotently:
       1. llama-server (LLM) on port 8080  -> $LlamaStart (see below)
-      2. assistant API (FastAPI) on port 8090 -> <this dir>\server.py
+      2. assistant API (FastAPI) on port 8090 -> <project>\server\server.py
+
+    Layout: python code + .venv + .env live in <project>\server\,
+    this script lives in <project>\scripts\.
 
     "Stop the server" in this project means stopping BOTH, so the autostart
     brings BOTH back. Each one is skipped when its health check already
@@ -22,11 +25,13 @@ param([string]$LlamaStart = '')
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Here       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$Python     = Join-Path $Here '.venv\Scripts\python.exe'
-$ServerDir  = $Here
+$ScriptsDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$Root       = Split-Path $ScriptsDir -Parent
+$ServerDir  = Join-Path $Root 'server'
+$Python     = Join-Path $ServerDir '.venv\Scripts\python.exe'
 if (-not $LlamaStart) {
-    $LlamaStart = Join-Path (Split-Path $Here -Parent) 'llm\start-model.ps1'
+    # Sibling of the project dir, e.g. <parent>\llm\start-model.ps1
+    $LlamaStart = Join-Path (Split-Path $Root -Parent) 'llm\start-model.ps1'
 }
 
 function Get-LanIp {
