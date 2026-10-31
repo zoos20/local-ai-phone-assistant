@@ -39,11 +39,17 @@ class VoiceStream(
         object Ready : Event()
         object Endpoint : Event()
         data class Hear(val text: String) : Event()
+        /** Предложение ответа (фаза 6, стриминг) -- текст для лога/UI. */
+        data class Sentence(val text: String) : Event()
+        /** WAV-чанк ответа по мере готовности (фаза 6, стриминг). */
+        data class AudioChunk(val wav: ByteArray) : Event()
         data class Reply(
             val reply: String,
             val confirm: Boolean,
             val token: String?,
             val audio: ByteArray?,
+            /** Аудио-чанки уже играют/играли -- reply НЕ озвучивать. */
+            val streamed: Boolean = false,
         ) : Event()
 
         object Failed : Event()
@@ -127,6 +133,7 @@ class VoiceStream(
                 confirm = r.optBoolean("confirm"),
                 token = r.optString("token").takeIf { it.isNotEmpty() },
                 audio = audio,
+                streamed = r.optBoolean("streamed"),
             ),
         )
         return true
@@ -150,10 +157,23 @@ class VoiceStream(
                 onEvent(Event.Endpoint)
             }
             "hear" -> onEvent(Event.Hear(msg.optString("text")))
+            "sentence" -> onEvent(Event.Sentence(msg.optString("text")))
+            "audio" -> {
+                val wav = msg.optString("b64")
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }
+                if (wav != null) {
+                    if (pendReply != null) {
+                        // старый стиль (сервер без стриминга): audio ПОСЛЕ
+                        // reply -> откладываем до done
+                        pendAudio = wav
+                    } else {
+                        // стриминг (фаза 6): чанк пришёл ДО reply -> сразу
+                        onEvent(Event.AudioChunk(wav))
+                    }
+                }
+            }
             "reply" -> pendReply = msg
-            "audio" -> pendAudio = msg.optString("b64")
-                .takeIf { it.isNotEmpty() }
-                ?.let { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }
             "done" -> flushReply()
             else -> Log.i(TAG, "event: $msg")
         }

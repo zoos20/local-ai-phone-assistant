@@ -168,7 +168,7 @@ class AssistantService : Service() {
         // обычной схеме COMMAND (конец = тишина, стоп-слово, MAX_COMMAND_MS).
         // Цепочка ограничена MAX_FOLLOWUP, чтобы не крутиться бесконечно.
         private const val FOLLOWUP_START_MS = 5_000
-        private const val MAX_FOLLOWUP = 2           // глубина подряд без «Геммы»
+        private const val MAX_FOLLOWUP = 10          // глубина подряд без «Геммы»
         // Сколько «речевой» энергии (мс) подряд в follow-up-окне = начало
         // вопроса (а не случайный шум кадра). prelude 2.5 с из ring-буфера
         // уже содержит первые слова, поэтому начало фразы не теряется.
@@ -288,6 +288,17 @@ class AssistantService : Service() {
     @Volatile private var streamConfirm = false
     @Volatile private var streamToken: String? = null
     @Volatile private var streamAudio: ByteArray? = null
+    /** Сервер стримил аудио-чанки -- reply НЕ озвучивать повторно. */
+    @Volatile private var streamStreamed = false
+    /** Хотя бы один чанк приходил (фолбэк POST /voice не дублирует речь). */
+    @Volatile private var streamChunkSeen = false
+    // Очередь WAV-чанков стриминговой озвучки (фаза 6, п. 1): игрок берёт
+    // по мере готовности, пока chunkStreamDone не придёт финал (reply).
+    // Монитор -- java.lang.Object (у Kotlin-Any нет wait/notify).
+    private val chunkLock = java.lang.Object()
+    private val chunkQueue = ArrayDeque<ByteArray>()
+    @Volatile private var chunkStreamDone = false
+    @Volatile private var chunkPlayerRunning = false
     // wav команды на случай обрыва стрима после «end» (фолбэк POST /voice)
     @Volatile private var pendingWav: ByteArray? = null
 
@@ -1564,6 +1575,12 @@ class AssistantService : Service() {
         streamConfirm = false
         streamToken = null
         streamAudio = null
+        streamStreamed = false
+        streamChunkSeen = false
+        synchronized(chunkLock) {
+            chunkQueue.clear()
+            chunkStreamDone = false
+        }
         voiceStream = VoiceStream(server) { ev ->
             when (ev) {
                 is VoiceStream.Event.Ready ->
@@ -1574,6 +1591,18 @@ class AssistantService : Service() {
                 }
                 is VoiceStream.Event.Hear ->
                     Log.i(TAG, "stream hear: '${ev.text}'")
+                is VoiceStream.Event.Sentence ->
+                    Log.i(TAG, "stream sentence: '${ev.text}'")
+                is VoiceStream.Event.AudioChunk -> {
+                    // стриминговая озвучка (фаза 6): чанк -> в очередь,
+                    // игрок играет по мере готовности (первый звук ~1-1.5 с)
+                    streamChunkSeen = true
+                    synchronized(chunkLock) {
+                        chunkQueue.addLast(ev.wav)
+                        chunkLock.notifyAll()
+                    }
+                    startChunkPlayer()
+                }
                 is VoiceStream.Event.Reply -> {
                     // финал сессии: ответ (+confirm/token/wav) -- озвучиваем
                     // и возвращаемся как в processCommand
@@ -1581,12 +1610,28 @@ class AssistantService : Service() {
                     streamConfirm = ev.confirm
                     streamToken = ev.token
                     streamAudio = ev.audio
+                    streamStreamed = ev.streamed
+                    if (ev.streamed) {
+                        // чанки уже играют/играли -- закрываем очередь игрока
+                        synchronized(chunkLock) {
+                            chunkStreamDone = true
+                            chunkLock.notifyAll()
+                        }
+                    }
                     scope.launch { finishStreamReply() }
                 }
-                is VoiceStream.Event.Failed ->
+                is VoiceStream.Event.Failed -> {
+                    // обрыв: игрок не должен ждать чанки вечно (держал бы
+                    // SPEAK_LOCK) -- закрываем очередь
+                    synchronized(chunkLock) {
+                        chunkStreamDone = true
+                        chunkLock.notifyAll()
+                    }
                     // стрим упал: если мы уже ждём reply (state=SPEAKING) --
                     // ответа не будет, отвечаем по фолбэку POST wav
-                    if (state == State.SPEAKING && streamReply == null) {
+                    if (state == State.SPEAKING && streamReply == null &&
+                        !streamChunkSeen
+                    ) {
                         Log.w(TAG, "stream died before reply -- " +
                                 "fallback POST /voice")
                         val wav = pendingWav
@@ -1594,6 +1639,7 @@ class AssistantService : Service() {
                     } else {
                         Log.w(TAG, "stream failed -- fallback по локальному decision")
                     }
+                }
             }
         }.also { it.setPrelude(prelude) }
     }
@@ -1631,8 +1677,21 @@ class AssistantService : Service() {
         try {
             val reply = streamReply?.ifBlank { null } ?: "Готово"
             val audio = streamAudio
-            Log.i(TAG, "stream reply: $reply (confirm=$streamConfirm)")
-            speak(reply, audio)
+            Log.i(TAG, "stream reply: $reply (confirm=$streamConfirm " +
+                    "streamed=$streamStreamed)")
+            if (streamStreamed) {
+                // чанки уже играли/играют (фаза 6) -- повторно НЕ
+                // озвучиваем (задвоение речи); ждём конца очереди игрока
+                // перед переходом в CONFIRM/follow-up
+                val deadline = System.currentTimeMillis() + 20_000
+                while (chunkPlayerRunning && !speechInterrupted &&
+                    System.currentTimeMillis() < deadline
+                ) {
+                    Thread.sleep(50)
+                }
+            } else {
+                speak(reply, audio)
+            }
 
             if (speechInterrupted) {
                 Log.i(TAG, "reply interrupted by stop word -- back to wake")
@@ -1871,6 +1930,113 @@ class AssistantService : Service() {
     }
 
     private val SPEAK_LOCK = Any()
+
+    // ------------------------------------------------------------------
+    // Стриминговая озвучка чанками (фаза 6, п. 1): сервер шлёт WAV-чанки
+    // по мере генерации предложений -- играем по мере готовности (первый
+    // звук ~1-1.5 с вместо ожидания полного ответа 4-9 с).
+    //
+    // Один игрок на сессию: берёт SPEAK_LOCK (не пересекается с speak()
+    // из doConfirm), уважает speechInterrupted (стоп-слово) и барж-ин
+    // паузу (speakPauseReq/speakResumeReq -- как speakLocked).
+    // ------------------------------------------------------------------
+    private fun startChunkPlayer() {
+        if (chunkPlayerRunning) return
+        synchronized(chunkLock) {
+            if (chunkPlayerRunning) return
+            chunkPlayerRunning = true
+        }
+        scope.launch {
+            synchronized(SPEAK_LOCK) {
+                try {
+                    while (true) {
+                        val wav = synchronized(chunkLock) {
+                            while (chunkQueue.isEmpty() && !chunkStreamDone &&
+                                !speechInterrupted && running
+                            ) {
+                                try {
+                                    chunkLock.wait(200)
+                                } catch (_: InterruptedException) {
+                                }
+                            }
+                            if (speechInterrupted || !running) null
+                            else chunkQueue.removeFirstOrNull()
+                        } ?: break
+                        playChunkLocked(wav)
+                    }
+                } finally {
+                    synchronized(chunkLock) {
+                        chunkPlayerRunning = false
+                        chunkQueue.clear()
+                        chunkLock.notifyAll()
+                    }
+                    Log.i(TAG, "chunk player done")
+                }
+            }
+        }
+    }
+
+    /** Играет один WAV-чанк под SPEAK_LOCK (логика speakLocked). */
+    private fun playChunkLocked(wav: ByteArray) {
+        val latch = CountDownLatch(1)
+        speakLatch = latch
+        var player: MediaPlayer? = null
+        try {
+            val file = File(cacheDir, "chunk.wav")
+            file.writeBytes(wav)
+            val p = MediaPlayer()
+            player = p
+            p.setDataSource(file.absolutePath)
+            p.setOnCompletionListener { latch.countDown() }
+            p.setOnErrorListener { _, _, _ ->
+                latch.countDown()
+                false
+            }
+            p.prepare()
+            if (speechInterrupted) return
+            p.setVolume(1.5f, 1.5f)
+            p.start()
+            speakPlayer = p
+            playbackSeen = true
+            playbackStartMs = System.currentTimeMillis()
+            while (!latch.await(40, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                if (speechInterrupted) break
+                if (speakPauseReq) {
+                    speakPauseReq = false
+                    try {
+                        if (p.isPlaying) p.pause()
+                    } catch (_: Exception) {
+                    }
+                }
+                if (speakResumeReq) {
+                    speakResumeReq = false
+                    try {
+                        p.start()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "chunk play failed", t)
+            latch.countDown()
+        } finally {
+            speakLatch = null
+            speakPlayer = null
+            speakPauseReq = false
+            speakResumeReq = false
+            if (speechInterrupted) {
+                try {
+                    player?.stop()
+                } catch (_: Exception) {
+                }
+                Log.i(TAG, "chunk interrupted by stop word")
+            }
+            try {
+                player?.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     private fun speakLocked(text: String, preWav: ByteArray? = null) {
         if (text.isBlank()) return

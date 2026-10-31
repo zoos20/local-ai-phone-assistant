@@ -51,20 +51,25 @@
 
 ```
 server.py               FastAPI: /ask /voice /ws_voice /tts /confirm /profile /health
-llm.py                  промпт, профили (характер ↔ голос ↔ пол), вызов llama-server
+llm.py                  промпт, профили (характер ↔ голос ↔ пол), стриминг
+                        ответа (chat_stream/decide_stream) от llama-server
 stt.py                  распознавание речи (faster-whisper, CPU, int8)
 tts.py                  озвучка: kokoro-ru через sidecar, фолбэк Piper
 tts_kokoro_server.py    sidecar kokoro-ru на 8091 (отдельное окружение .venv-tts)
 tools.py                действия: поиск, Telegram, VK, звонки
 config.py               настройки из .env (префикс ASSISTANT_)
 login_tg.py             разовый вход в Telegram (Telethon user session)
-start-all.ps1           автозапуск стека (llama-server + server.py)
-start-kokoro.ps1        запуск TTS-sidecar
-setup-firewall.ps1      разовый: правило фаервола для порта 8090 (админ)
-setup-adb.ps1           разовый: ADB-интерфейс телефона + фаервол (админ)
+scripts/                скрипты запуска/настройки (PowerShell):
+  start-all.ps1           автозапуск стека (llama-server + server.py)
+  start-kokoro.ps1        запуск TTS-sidecar
+  setup-firewall.ps1      разовый: правило фаервола для порта 8090 (админ)
+  setup-adb.ps1           разовый: ADB-интерфейс телефона + фаервол (админ)
 android/                клиент-приложение (Kotlin, foreground service)
 models/                 голоса Piper (*.onnx) — не в репозитории
 ```
+
+Python-модули намеренно лежат в корне (плоские импорты `import llm` и пути
+`Path(__file__).parent` для `.env`/моделей/данных).
 
 ## Требования
 
@@ -102,12 +107,12 @@ copy .env.example .env     # заполнить (см. «Настройка .env
 
 ```powershell
 # Весь стек сразу (llama-server + API):
-powershell -ExecutionPolicy Bypass -File start-all.ps1
+powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 # Или по частям:
 <путь-к-llama-server>                      # LLM на 8080
 .venv\Scripts\python server.py             # API на 8090
-powershell -File start-kokoro.ps1          # TTS на 8091 (нужен .venv-tts)
+powershell -File scripts\start-kokoro.ps1  # TTS на 8091 (нужен .venv-tts)
 
 # Проверка:
 curl http://127.0.0.1:8090/health
@@ -116,7 +121,7 @@ curl http://127.0.0.1:8090/health
 Разовый сетевой доступ (от имени администратора):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File setup-firewall.ps1   # порт 8090 из LAN
+powershell -ExecutionPolicy Bypass -File scripts\setup-firewall.ps1   # порт 8090 из LAN
 ```
 
 ## Настройка .env
@@ -152,7 +157,7 @@ Telegram и VK работают **необязательно**: при пуст�
 | GET | `/health` | — | `{"status","model","stt_model","tts_engine",...}` |
 | POST | `/ask` | `{"text":"..."}` | `{"reply","action","args","needs_confirm","token","elapsed_ms"}` |
 | POST | `/voice` | multipart `file` (wav/ogg/webm/m4a) | как `/ask` + `{"text","stt_ms"}` |
-| WS | `/ws_voice` | стрим аудио-чанков | события конца фразы → готовый ответ |
+| WS | `/ws_voice` | стрим аудио-чанков | события: `speech`/`hear`/`sentence`/`audio` (чанки WAV) → `reply` → `done` |
 | POST | `/tts` | `{"text":"...","voice":"..."}` | WAV (`audio/wav`), голос берётся из профиля |
 | POST | `/confirm` | `{"token":"...","yes":true\|false}` | `{"reply","ok"}` |
 | GET | `/profile` | — | текущий профиль, голос, список доступных |
@@ -162,13 +167,34 @@ Telegram и VK работают **необязательно**: при пуст�
 Отправка сообщений и звонки выполняются **только** после `/confirm` с
 `yes:true` (окно подтверждения ограничено `ASSISTANT_CONFIRM_TTL`).
 
+### Стриминговый конвейер `/ws_voice` (фаза 6)
+
+Ответ озвучивается **по мере генерации**, а не после полного готового текста:
+
+1. LLM стримится через `llm.chat_stream()`; инкрементальный парсер
+   (`_StreamParser`) вырезает законченные предложения из поля `reply` и
+   отдельно ловит поле `query` (поисковый запрос для спекулятивного поиска).
+2. Каждое предложение уходит в TTS (kokoro-ru), и WAV-чанк сразу летит
+   телефону событием `audio`; текст — событием `sentence`.
+3. **Спекулятивный поиск**: поле `query` из первого токена запускает поиск
+   заранее (кэш 180 с, таймаут 15 с) — когда приходит `needs_confirm`,
+   готовый результат уже в `/confirm`, не дожидаясь таймаута.
+4. Телефон играет чанки по очереди (`chunkQueue`) под SPEAK_LOCK, уважая
+   стоп-слово и паузу барж-ин; финальный `reply` с флагом `streamed=true`
+   повторно НЕ озвучивается.
+
+Замеры (ПК без GPU, Gemma-4-E4B): первый токен ~1 с, первый звук ~3.5 с
+от старта LLM (раньше — 6–15 с после полного ответа).
+
 ## Android-приложение
 
 Kotlin-клиент (`android/`), foreground service с доступом к микрофону:
 
 - распознаёт wake word офлайн через **Vosk** (модель подгружается в приложение),
-- записывает речь и стримит её на сервер (`/ws_voice`), проигрывает ответ (WAV),
+- записывает речь и стримит её на сервер (`/ws_voice`), проигрывает ответ
+  по мере готовности — очередью WAV-чанков (события `sentence`/`audio`),
 - поддерживает Bluetooth-аудио и системную громкость озвучки,
+- follow-up до 10 уточнений подряд без повторного «Гемма»,
 - экран показывает адрес сервера, статус подключения и кнопки управления.
 
 Сборка и установка (adb не обязан быть в PATH):
@@ -187,7 +213,9 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 Адрес сервера вводится прямо на экране приложения (по умолчанию подсказка
 `http://192.168.1.100:8090` — замените на IP вашего ПК).
 
-## Константы таймингов (server.py)
+## Константы таймингов
+
+Телефон (`AssistantService.kt`):
 
 | Константа | Значение | Назначение |
 |---|---|---|
@@ -199,7 +227,16 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 | `SPEECH_RMS` / `WAKE_MIN_RMS` | 330 / 120 | пороги громкости (речь / wake) |
 | `VERIFY_RETRY_MS` | 1 500 | окно повторного wake после ложного срабатывания |
 | `FOLLOWUP_START_MS` / `FOLLOWUP_TRIG_MS` | 5 000 / 300 | follow-up запросы после ответа |
-| `MAX_FOLLOWUP` | 2 | максимум follow-up подряд |
+| `MAX_FOLLOWUP` | 10 | максимум follow-up подряд |
+
+Сервер (`server.py`, конвенции `/ws_voice`):
+
+| Константа | Значение | Назначение |
+|---|---|---|
+| `_WS_QUIET_MS` | 1 300 | тишина, после которой фраза считается сказанной |
+| `_WS_SEG_QUIET_MS` | 900 | пауза между сегментами в предложении |
+| `_WS_GRACE_MS` | 2 500 | льготное окно после «конца» фразы |
+| prefetch-поиск | TTL 180 с / таймаут 15 с | спекулятивный поиск по `query` из LLM |
 
 Контекст LLM — 32768 токенов (`-c 32768` в llama.cpp), история диалога —
 `ASSISTANT_HISTORY_SIZE` реплик с TTL.

@@ -354,6 +354,195 @@ def chat(messages: list[dict[str, str]], *, max_tokens: int = 1200,
     return content
 
 
+def chat_stream(messages: list[dict[str, str]], *,
+                on_token=None,
+                max_tokens: int = 1200,
+                temperature: float = 0.2) -> str:
+    """Стриминговый вызов llama-server (фаза 6, п. 1).
+
+    Шлёт stream=true и вызывает on_token(delta) по мере поступления токенов
+    (первый токен ~0.3-0.5 с вместо ожидания полного ответа). Возвращает
+    полный content -- тот же формат, что и chat().
+    """
+    headers = {}
+    if settings.llm_api_key:
+        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+
+    parts: list[str] = []
+    try:
+        with httpx.Client(base_url=settings.llm_base_url, headers=headers,
+                          timeout=120.0) as client:
+            with client.stream(
+                "POST",
+                "/chat/completions",
+                json={
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content") or ""
+                    if delta:
+                        parts.append(delta)
+                        if on_token is not None:
+                            on_token(delta)
+    except httpx.HTTPError as exc:
+        raise LLMError(f"LLM недоступна: {exc}") from exc
+
+    content = "".join(parts).strip()
+    if not content:
+        raise LLMError("пустой ответ LLM (стрим)")
+    return content
+
+
+# --- потоковый разбор ответа модели (фаза 6, п. 1) -------------------------
+# Модель отвечает JSON {"reply": "...", ...}: поле reply идёт ПЕРВЫМ, и его
+# можно озвучивать ПО МЕРЕ поступления токенов, не дожидаясь конца генерации
+# (действия/args дождутся конца). Инкрементальный парсер вырезает готовые
+# предложения из частично накопленной строки reply.
+_REPLY_KEY_RE = re.compile(r'"reply"\s*:\s*"')
+_QUERY_KEY_RE = re.compile(r'"query"\s*:\s*"')
+# конец предложения: . ! ? … (+ возможная закрывающая кавычка) + пробел/конец
+_SENT_END_RE = re.compile(r"[.!?…][»\"]?(?=\s|$)")
+
+
+class _StreamParser:
+    """Вырезает готовые предложения из поля reply по мере стриминга.
+
+    feed(delta) -> list[полных предложений]; close() -> хвост (последнее
+    предложение без финальной пунктуации). on_query вызывается один раз,
+    когда строка query полностью дописана (speculative-поиск, п. 6).
+    """
+
+    def __init__(self, on_query=None) -> None:
+        self._raw = ""            # весь сырой поток
+        self._reply_raw = ""      # накопленный текст ВНУТРИ строки reply
+        self._reply_open = False  # нашли начало "reply": "
+        self._reply_closed = False
+        self._emitted = 0         # сколько символов reply уже отдано
+        self._query_done = False
+        self._on_query = on_query
+        self.reply_text = ""      # декодированный reply (для фолбэков)
+        self.spoken = ""          # всё, что уже отдано на озвучку (для is_committed)
+
+    @staticmethod
+    def _decode(s: str) -> str:
+        """Частичная декодировка escape-последовательностей JSON-строки."""
+        try:
+            return json.loads('"' + s + '"')
+        except (json.JSONDecodeError, ValueError):
+            # обрыв на escape в конце ("\x") -- отрезаем хвост и честно
+            # раскодируем основную часть
+            for cut in (1, 2):
+                if len(s) > cut:
+                    try:
+                        return json.loads('"' + s[:-cut] + '"')
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            return (s.replace('\\"', '"').replace("\\n", " ")
+                    .replace("\\\\", "\\"))
+
+    @staticmethod
+    def _closed_str_end(s: str) -> int:
+        """Индекс НЕэкранированной закрывающей кавычки в s, или -1."""
+        i = 0
+        n = len(s)
+        while i < n:
+            c = s[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                return i
+            i += 1
+        return -1
+
+    def feed(self, delta: str) -> list[str]:
+        if self._reply_closed:
+            # reply уже дописан, но query (action/args идут ПОСЛЕ reply)
+            # может появиться позже -- продолжаем следить
+            self._raw += delta
+            self._maybe_query()
+            return []
+        self._raw += delta
+        if not self._reply_open:
+            m = _REPLY_KEY_RE.search(self._raw)
+            if not m:
+                # заодно ловим полный query для speculative-поиска (п. 6)
+                self._maybe_query()
+                return []
+            self._reply_open = True
+            self._reply_raw = self._raw[m.end():]
+        else:
+            self._reply_raw += delta
+        end = self._closed_str_end(self._reply_raw)
+        if end >= 0:
+            self._reply_closed = True
+            self._reply_raw = self._reply_raw[:end]
+        text = self._decode(self._reply_raw)
+        self.reply_text = text
+        out: list[str] = []
+        while True:
+            m2 = _SENT_END_RE.search(text, self._emitted)
+            if not m2:
+                break
+            sent = text[self._emitted:m2.end()].strip()
+            self._emitted = m2.end()
+            if len(sent) >= 3:
+                out.append(sent)
+                self.spoken = (self.spoken + " " + sent).strip()
+        self._maybe_query()
+        return out
+
+    def _maybe_query(self) -> None:
+        """Спекулятивный поиск (п. 6): как только query дописан целиком."""
+        if self._query_done or self._on_query is None:
+            return
+        m = _QUERY_KEY_RE.search(self._raw)
+        if not m:
+            return
+        q = self._raw[m.end():]
+        end = self._closed_str_end(q)
+        if end < 0:
+            return
+        self._query_done = True
+        query = self._decode(q[:end]).strip()
+        if query:
+            try:
+                self._on_query(query)
+            except Exception:  # noqa: BLE001 -- префетч не должен ломать стрим
+                log.exception("on_query callback failed")
+
+    def close(self) -> str | None:
+        """Хвост reply (последнее предложение без пунктуации), если есть."""
+        if not self._reply_open:
+            return None
+        self._reply_closed = True
+        tail = self.reply_text[self._emitted:].strip()
+        self._emitted = len(self.reply_text)
+        if len(tail) >= 3:
+            self.spoken = (self.spoken + " " + tail).strip()
+            return tail
+        return None
+
+
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
 # Скобочный дайджест истории: «(поиск в интернете: X)» / «(отправлено: …)»
 _DIGEST_SEARCH_RE = re.compile(r"^\(\s*поиск в интернете:\s*(.+?)\s*\)$", re.I)
@@ -436,15 +625,10 @@ def _time_system() -> str:
             "дне недели -- отвечай по ним, а не по памяти модели.")
 
 
-def decide(user_text: str,
-           history: list[dict[str, str]] | None = None) -> Decision:
-    """Текст пользователя -> валидное решение (reply/action/args).
-
-    history — предыдущие реплики диалога (роли user/assistant), чтобы
-    работали уточнения («а завтра?») и местоимения. Подмешиваются перед
-    текущей репликой.
-    """
-    # system[0] статичный (кэш префикса), system[1] -- время ( меняется ).
+def _decide_messages(user_text: str,
+                     history: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Сообщения decide(): system[0] статичный (кэш префикса), system[1]
+    время, история, реплика пользователя."""
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt()},
         {"role": "system", "content": _time_system()},
@@ -459,17 +643,32 @@ def decide(user_text: str,
                 continue
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_text})
+    return messages
 
-    # Диагностика: что реально уходит в LLM (системник + время + история +
-    # реплика). system[0] статичный, system[1] -- время.
-    log.info("LLM messages: system=%d hist=%d user=%r",
-             len(messages[0]["content"]), len(history or []), user_text)
+
+def _decide_with(messages: list[dict[str, str]],
+                 make_chat,
+                 is_committed=None) -> Decision:
+    """Общая цепочка decide/decide_stream: запрос -> разбор -> фолбэки.
+
+    make_chat(attempt) -> callable(messages) -> raw-текст ответа (вызывается
+    на КАЖДОЙ попытке -- для стриминга важен свежий парсер на повторе).
+    is_committed() -> True, если часть ответа УЖЕ озвучена (стримингом):
+    тогда повтор с новым текстом задвоил бы речь -> не повторяем, а
+    возвращаем то, что уже сказано.
+    """
     decision: Decision | None = None
     for attempt in range(2):
         try:
-            raw = chat(messages, max_tokens=1200)
+            raw = make_chat(attempt)(messages)
         except LLMError as exc:
             if attempt == 0:
+                if is_committed is not None and is_committed():
+                    # стрим уже озвучил часть ответа -- повтор задвоил бы
+                    # речь; возвращаем сказанное
+                    log.warning("chat() ошибка после стрима (%s) -- берём "
+                                "озвученное", exc)
+                    return Decision(reply=is_committed(), action="none")
                 log.warning("chat() ошибка (%s) -- повтор", exc)
                 continue
             return Decision(reply="Сервер модели не отвечает, попробуй ещё раз.",
@@ -497,7 +696,7 @@ def decide(user_text: str,
                 return Decision(reply=f"Ищу в интернете: {query}",
                                 action="search", args={"query": query})
             if clean and _META_JSON_RE.search(clean):
-                if attempt == 0:
+                if attempt == 0 and (is_committed is None or not is_committed()):
                     log.warning("мета-ответ про формат (%r) -- повтор "
                                 "с напоминанием", clean[:120])
                     messages.append({
@@ -509,8 +708,10 @@ def decide(user_text: str,
                                    "собеседник.",
                     })
                     continue
-                log.info("фолбэк: мета-ответ про формат -- не озвучиваем "
-                         "(%r)", clean[:120])
+                if is_committed is not None and is_committed():
+                    # мета-фраза уже озвучена стримом -- не задваиваем
+                    # «Я не совсем понял», история = то, что слышали
+                    return Decision(reply=is_committed(), action="none")
                 return Decision(
                     reply="Я не совсем понял. Скажи ещё раз, пожалуйста.",
                     action="none",
@@ -521,9 +722,10 @@ def decide(user_text: str,
                 log.info("фолбэк: текстовый ответ без JSON -> reply "
                          "без повтора (%r)", clean[:120])
                 return Decision(reply=clean[:1500], action="none")
-            if attempt == 0:
+            if attempt == 0 and (is_committed is None or not is_committed()):
                 # Сломанный JSON/пусто -- здесь повтор с напоминанием
-                # о схеме уместен.
+                # о схеме уместен (но НЕ если стрим уже озвучил reply:
+                # повтор задвоил бы речь).
                 log.warning("модель ответила не по схеме (%r) -- повтор",
                             raw[:200])
                 messages.append({
@@ -535,6 +737,8 @@ def decide(user_text: str,
                                "собеседник.",
                 })
                 continue
+            if is_committed is not None and is_committed():
+                return Decision(reply=is_committed(), action="none")
             return Decision(
                 reply="Я не совсем понял. Скажи ещё раз, пожалуйста.",
                 action="none",
@@ -555,6 +759,85 @@ def decide(user_text: str,
     if decision.action == "call" and not str(decision.args.get("contact", "")).strip():
         return Decision(reply="Кому позвонить? Назови имя контакта.", action="none")
     return decision
+
+
+def decide(user_text: str,
+           history: list[dict[str, str]] | None = None) -> Decision:
+    """Текст пользователя -> валидное решение (reply/action/args).
+
+    history — предыдущие реплики диалога (роли user/assistant), чтобы
+    работали уточнения («а завтра?») и местоимения. Подмешиваются перед
+    текущей репликой.
+    """
+    messages = _decide_messages(user_text, history)
+    # Диагностика: что реально уходит в LLM (системник + время + история +
+    # реплика). system[0] статичный, system[1] -- время.
+    log.info("LLM messages: system=%d hist=%d user=%r",
+             len(messages[0]["content"]), len(history or []), user_text)
+    return _decide_with(messages, lambda: lambda msgs: chat(msgs, max_tokens=1200))
+
+
+def decide_stream(user_text: str,
+                  history: list[dict[str, str]] | None = None,
+                  *,
+                  on_sentence=None,
+                  on_first_token=None,
+                  on_query=None) -> Decision:
+    """Стриминговый decide (фаза 6, п. 1): тот же результат, что и decide(),
+    но reply уходит по предложениям через on_sentence, пока генерация ещё
+    идёт (первый токен ~0.3-0.5 с вместо 1.5-8 с полного ответа).
+
+    on_sentence(text)  -- готовое предложение для озвучки (вызывается из
+                          потока llama-стрима; на сервере -- в отдельном
+                          потоке, очередь в asyncio);
+    on_first_token()   -- первый токен content получен (замер таймингов);
+    on_query(query)    -- поисковый запрос дописан целиком (спекулятивный
+                          старт поиска, п. 6).
+    """
+    messages = _decide_messages(user_text, history)
+    log.info("LLM messages (stream): system=%d hist=%d user=%r",
+             len(messages[0]["content"]), len(history or []), user_text)
+
+    # Озвученный текст (для is_committed): если первая попытка уже
+    # стримнула предложения -- повтор с новым текстом задвоил бы речь.
+    spoken: list[str] = []
+
+    def _make_stream_chat(attempt: int):
+        # Свежий парсер на каждую попытку: повтор -- новый ответ с нуля.
+        parser = _StreamParser(on_query)
+        first = False
+
+        def _stream(msgs: list[dict[str, str]]) -> str:
+            nonlocal first
+
+            def _on_token(delta: str) -> None:
+                nonlocal first
+                if not first:
+                    first = True
+                    if on_first_token is not None:
+                        on_first_token()
+                if on_sentence is not None:
+                    for sent in parser.feed(delta):
+                        spoken.append(sent)
+                        on_sentence(sent)
+
+            # На второй попытке НЕ стримим: первая могла уже озвучить
+            # часть реплики (см. is_committed) -- повтор идёт молча,
+            # озвучка пойдёт финальным событием на сервере.
+            if on_sentence is not None and attempt == 0:
+                raw = chat_stream(msgs, on_token=_on_token)
+                tail = parser.close()
+                if tail:
+                    spoken.append(tail)
+                    on_sentence(tail)
+            else:
+                raw = chat(msgs, max_tokens=1200)
+            return raw
+
+        return _stream
+
+    return _decide_with(messages, _make_stream_chat,
+                        is_committed=lambda: " ".join(spoken).strip())
 
 
 def answer_from_memory(question: str) -> str:

@@ -41,7 +41,7 @@ _HISTORY_STAMP: float = 0.0
 _HISTORY_LOCK = asyncio.Lock()
 
 # Логи и в консоль, и в файл -- чтобы видеть транскрипты с телефона,
-# когда консоль недоступна (<project>/server.log).
+# когда консоль недоступна (E:\assistant\server.log).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -319,6 +319,36 @@ async def _run_search(query: str) -> str:
     return await asyncio.to_thread(llm.summarize_search, query, results)
 
 
+# --------------------------------------------------------------------------
+# Спекулятивный поиск (фаза 6, п. 6): пока модель дописывает JSON, запрос
+# уже улетает в интернет. Пользователь всё равно скажет «да» (обычно через
+# 1-2 с после вопроса) -- поиск к тому моменту готов, и /confirm отвечает
+# мгновенно вместо 5-10 с. Кэш живёт ~3 минуты.
+# --------------------------------------------------------------------------
+_PREFETCH_TTL_S = 180.0
+_prefetch_cache: dict[str, tuple[float, str]] = {}
+
+
+def _prefetch_key(query: str) -> str:
+    return " ".join(query.lower().split())
+
+
+async def _prefetch_search(query: str) -> None:
+    """Фоновый поиск по запросу (не роняет сессию при ошибке/таймауте)."""
+    key = _prefetch_key(query)
+    try:
+        reply = await asyncio.wait_for(_run_search(query), timeout=15.0)
+    except Exception as exc:  # noqa: BLE001 -- префетч best-effort
+        log.info("prefetch search failed for %r: %s", query, exc)
+        return
+    _prefetch_cache[key] = (time.time(), reply)
+    now = time.time()
+    for k in [k for k, (ts, _) in _prefetch_cache.items()
+              if now - ts > _PREFETCH_TTL_S]:
+        del _prefetch_cache[k]
+    log.info("prefetch search ready for %r (%d chars)", query, len(reply))
+
+
 async def _dispatch(decision: llm.Decision) -> tuple[str, bool, str | None]:
     """Выполняет решение. Возвращает (reply, needs_confirm, token)."""
     if decision.action == "search":
@@ -370,8 +400,17 @@ async def ask(req: AskRequest) -> AskResponse:
     return await _answer(text)
 
 
-async def _answer(text: str) -> AskResponse:
-    """Общая цепочка: текст -> решение модели -> действие -> ответ."""
+async def _answer(text: str,
+                  on_sentence=None,
+                  on_first_token=None,
+                  on_query=None) -> AskResponse:
+    """Общая цепочка: текст -> решение модели -> действие -> ответ.
+
+    on_sentence/on_first_token/on_query (фаза 6, п. 1) -- включают
+    стриминговый путь decide_stream: предложения reply уходят на озвучку,
+    пока генерация ещё идёт (первый токен ~0.3-0.5 с вместо ожидания
+    полного ответа). Без них -- прежний decide() (POST /voice, /ask).
+    """
     t0 = time.perf_counter()
     log.info("ask: %r", text)
 
@@ -427,10 +466,51 @@ async def _answer(text: str) -> AskResponse:
 
     history = await get_history()
     t_llm = time.perf_counter()
-    decision = await asyncio.to_thread(llm.decide, text, history)
-    llm_ms = int((time.perf_counter() - t_llm) * 1000)
-    log.info("decision: action=%s args=%s (llm %d ms)",
-             decision.action, decision.args, llm_ms)
+
+    # Стриминговый путь (фаза 6, п. 1): decide_stream шлёт готовые
+    # предложения через on_sentence, пока генерация ещё идёт.
+    # llama-стрим блокирующий (httpx) -> в отдельном потоке.
+    if on_sentence is not None:
+        spoken: list[str] = []
+
+        def _on_sentence(s: str) -> None:
+            spoken.append(s)
+            try:
+                on_sentence(s)
+            except Exception:  # noqa: BLE001 -- очередь/сокет умерли
+                log.warning("on_sentence failed", exc_info=True)
+
+        first_ms: list[int] = []
+
+        def _first() -> None:
+            first_ms.append(int((time.perf_counter() - t_llm) * 1000))
+            if on_first_token is not None:
+                try:
+                    on_first_token()
+                except Exception:  # noqa: BLE001
+                    log.warning("on_first_token failed", exc_info=True)
+
+        def _run() -> llm.Decision:
+            return llm.decide_stream(text, history, on_sentence=_on_sentence,
+                                     on_first_token=_first, on_query=on_query)
+
+        try:
+            decision = await asyncio.to_thread(_run)
+        except Exception:  # noqa: BLE001 -- не должно случиться (llm гасит)
+            log.exception("decide_stream failed")
+            decision = llm.Decision(
+                reply="Сервер модели не отвечает, попробуй ещё раз.",
+                action="none")
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+        log.info("decision: action=%s args=%s (llm stream %d ms, "
+                 "first_token=%s, spoken=%d sentences)",
+                 decision.action, decision.args, llm_ms,
+                 first_ms[0] if first_ms else None, len(spoken))
+    else:
+        decision = await asyncio.to_thread(llm.decide, text, history)
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+        log.info("decision: action=%s args=%s (llm %d ms)",
+                 decision.action, decision.args, llm_ms)
 
     reply, needs_confirm, token = await _dispatch(decision)
     elapsed = int((time.perf_counter() - t0) * 1000)
@@ -510,8 +590,17 @@ async def voice(file: UploadFile = File(...)) -> VoiceResponse:
 #                      {"event":"hear","text":...}  -- сегмент распознан
 #                                                      НА ЛЕТУ (stt идёт
 #                                                      параллельно речи);
-#                      {"event":"reply","reply":...}-- ответ ассистента;
-#                      {"event":"audio","b64":...}  -- WAV ответа;
+#                      {"event":"sentence","text":..}-- предложение ответа
+#                                                      (фаза 6, стриминг);
+#                      {"event":"audio","b64":...}  -- WAV-чанк ответа
+#                                                      (по мере готовности
+#                                                      предложений);
+#                      {"event":"reply","reply":...,"streamed":bool}
+#                                                     -- итог: reply целиком
+#                                                      + confirm/token;
+#                                                      streamed=True -- чанки
+#                                                      уже играли, НЕ
+#                                                      озвучивать повторно;
 #                      {"event":"done"}             -- всё.
 # Endpointing -- на сервере: адаптивный порог (фон ×2.5, как на телефоне)
 # + тишина >= _WS_QUIET_MS после голоса. Сегментный stt на лету
@@ -521,8 +610,11 @@ async def voice(file: UploadFile = File(...)) -> VoiceResponse:
 WS_RATE = 16000                                   # PCM от телефона: 16 кГц
 _WS_BYTES_PER_MS = WS_RATE * 2 // 1000           # 32 байта/мс (s16le mono)
 _WS_FRAME = _WS_BYTES_PER_MS * 100               # RMS-кадр: 100 мс
-_WS_QUIET_MS = 1600          # тишина после голоса -> endpoint (было 3000
-                             # на телефоне; хвост досылается клиентом)
+_WS_QUIET_MS = 1300          # тишина после голоса -> endpoint (было 3000
+                             # на телефоне; хвост досылается клиентом).
+                             # 1600->1300 (фаза 6, п. 4): сокращаем
+                             # мёртвую паузу перед ответом; если «не
+                             # дослушивает» -- вернуть 1600.
 _WS_GRACE_MS = 2500          # первые мс не проверяем: хвост «Геммы»
                              # (prelude) + пауза до команды
 _WS_SEG_QUIET_MS = 900       # тишина -> речевой сегмент закрыт (stt на лету)
@@ -730,24 +822,103 @@ async def ws_voice(ws: WebSocket) -> None:
             await ws.send_json({"event": "done"})
             return
 
-        resp = await _answer(text)
+        # ---------------- стриминговый ответ (фаза 6, п. 1) ----------
+        # Предложения reply из llama-стрима -> TTS -> аудио-чанки клиенту
+        # по мере готовности (первый звук ~1-1.5 с вместо 4-9 с).
+        loop = asyncio.get_running_loop()
+        sent_q: asyncio.Queue[str | None] = asyncio.Queue()
+        t_ask = time.perf_counter()
+        first_ms: list[int] = []
+        tts_first_ms: list[int] = []
+        chunks_sent = 0
+
+        def _on_sentence(s: str) -> None:
+            # llama-стрим -- блокирующий поток -> в очередь event loop
+            loop.call_soon_threadsafe(sent_q.put_nowait, s)
+
+        def _on_first_token() -> None:
+            first_ms.append(int((time.perf_counter() - t_ask) * 1000))
+
+        def _on_query(q: str) -> None:
+            # спекулятивный поиск (п. 6): уходит в интернет, пока модель
+            # ещё дописывает ответ
+            asyncio.run_coroutine_threadsafe(_prefetch_search(q), loop)
+
+        async def _speak_stream() -> int:
+            """TTS предложений по мере генерации -> аудио-чанки клиенту."""
+            sent = 0
+            voice = llm.get_profile_voice()
+            while True:
+                s = await sent_q.get()
+                if s is None:
+                    return sent
+                try:
+                    wav = await asyncio.to_thread(tts_mod.synthesize, s, voice)
+                except Exception:  # noqa: BLE001 -- сбой одного предложения
+                    log.warning("ws_voice: tts(sentence) failed", exc_info=True)
+                    continue
+                if not wav:
+                    continue
+                if not tts_first_ms:
+                    tts_first_ms.append(int((time.perf_counter() - t_ask)
+                                            * 1000))
+                sent += 1
+                try:
+                    await ws.send_json({"event": "sentence", "text": s})
+                    await ws.send_json(
+                        {"event": "audio",
+                         "b64": base64.b64encode(wav).decode("ascii")})
+                except Exception:  # noqa: BLE001 -- клиент ушёл
+                    return sent
+
+        speak_task = asyncio.create_task(_speak_stream())
+        try:
+            resp = await _answer(text, on_sentence=_on_sentence,
+                                 on_first_token=_on_first_token,
+                                 on_query=_on_query)
+        finally:
+            await sent_q.put(None)          # конец потока предложений
+        chunks_sent = await speak_task
+
+        # needs_confirm (поиск/отправка/звонок): финальная реплика-вопрос
+        # («Скажи да...») -- её streamed-чанками НЕ передавали (стрим шёл
+        # от имени модели, до _dispatch) -> озвучиваем сейчас.
+        if resp.needs_confirm:
+            try:
+                wav = await asyncio.to_thread(tts_mod.synthesize, resp.reply,
+                                              llm.get_profile_voice())
+            except Exception:  # noqa: BLE001
+                log.warning("ws_voice: tts(confirm) failed", exc_info=True)
+                wav = b""
+            if wav:
+                if not tts_first_ms:
+                    tts_first_ms.append(int((time.perf_counter() - t_ask)
+                                            * 1000))
+                chunks_sent += 1
+                await ws.send_json({"event": "sentence", "text": resp.reply})
+                await ws.send_json(
+                    {"event": "audio",
+                     "b64": base64.b64encode(wav).decode("ascii")})
+
         # confirm/token -- телефону нужно для перехода в State.CONFIRM
         # (как в POST /voice; без них ломалось подтверждение поиска/отправки)
+        # streamed=True: аудио-чанки уже ушли -- телефон НЕ озвучивает
+        # reply повторно (иначе двойная речь).
         await ws.send_json({"event": "reply", "reply": resp.reply,
                             "confirm": resp.needs_confirm,
-                            "token": resp.token})
-        try:
-            wav = await asyncio.to_thread(tts_mod.synthesize, resp.reply,
-                                          llm.get_profile_voice())
-        except Exception:  # noqa: BLE001 -- без озвучки не должны падать
-            log.warning("ws_voice: tts failed", exc_info=True)
-            wav = b""
-        if wav:
-            await ws.send_json({"event": "audio",
-                                "b64": base64.b64encode(wav).decode("ascii")})
+                            "token": resp.token,
+                            "streamed": chunks_sent > 0})
         await ws.send_json({"event": "done"})
-        log.info("ws_voice: done in %d ms (reply in log above)",
-                 int((time.perf_counter() - t0) * 1000))
+        # тайминги этапов (фаза 6, п. 7): llm первый токен, tts первого
+        # предложения, итог -- от них зависит задержка до первого звука
+        log.info("ws_voice: done in %d ms (first_token=%s, "
+                 "tts_first=%s, to_first_sound=%s, chunks=%d)",
+                 int((time.perf_counter() - t0) * 1000),
+                 first_ms[0] if first_ms else None,
+                 tts_first_ms[0] if tts_first_ms else None,
+                 (first_ms[0] + tts_first_ms[0])
+                 if first_ms and tts_first_ms else None,
+                 chunks_sent)
     except Exception:  # noqa: BLE001 -- обрыв клиента/любая ошибка
         log.warning("ws_voice: session ended abnormally", exc_info=True)
     finally:
@@ -812,7 +983,14 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
         if pending.action == "send_tg":
             reply = await tools.tg_send(pending.args["to"], pending.args["message"])
         elif pending.action == "search":
-            reply = await _run_search(str(pending.args["query"]))
+            query = str(pending.args["query"])
+            cached = _prefetch_cache.pop(_prefetch_key(query), None)
+            if cached is not None and time.time() - cached[0] <= _PREFETCH_TTL_S:
+                # спекулятивный поиск (фаза 6, п. 6) уже прогрел результат
+                log.info("confirm search: from prefetch cache (%r)", query)
+                reply = cached[1]
+            else:
+                reply = await asyncio.wait_for(_run_search(query), timeout=15.0)
         elif pending.action == "call":
             # Фаза 4 (звонки): номер набирает ТЕЛЕФОН (контакт ищется в его
             # телефонной книге, у ПК доступа к контактам нет). Мы лишь
@@ -825,7 +1003,10 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
         else:
             reply = await asyncio.to_thread(tools.vk_send, pending.args["to"],
                                             pending.args["message"])
-    except tools.ToolError as exc:
+    except (tools.ToolError, asyncio.TimeoutError) as exc:
+        if isinstance(exc, asyncio.TimeoutError):
+            exc = tools.ToolError("Поиск не ответил за 15 секунд. "
+                                  "Попробуй спросить иначе.")
         await add_turn("assistant", str(exc))
         return ConfirmResponse(reply=str(exc), ok=False)
 
