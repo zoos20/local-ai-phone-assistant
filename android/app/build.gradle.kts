@@ -1,0 +1,42 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "ru.gemma.assistant"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "ru.gemma.assistant"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "0.1"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+}
+
+dependencies {
+    // Оффлайн wake word + распознавание (русскоязычная модель качается отдельно)
+    implementation("com.alphacephei:vosk-android:0.3.75")
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    // WebSocket-стриминг аудио на сервер во время речи (фаза 6, п. 1)
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+}

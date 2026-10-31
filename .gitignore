@@ -1,0 +1,29 @@
+# --- секреты и локальные данные ---
+.env
+active_profile.txt
+*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+.venv-tts/
+
+# --- тяжёлые артефакты (модели, кэши, сессии) ---
+models/
+.cache/
+data/
+stt_debug/
+
+# --- android ---
+android/local.properties
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/release/
+
+# --- редакторы/ОС ---
+.vscode/
+.idea/
+Thumbs.db

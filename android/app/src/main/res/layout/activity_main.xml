@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Гемма — голосовой ассистент"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:paddingBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Адрес сервера (ПК):"
+        android:textSize="13sp" />
+
+    <EditText
+        android:id="@+id/serverUrl"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="http://192.168.1.100:8090"
+        android:inputType="textUri"
+        android:textSize="15sp" />
+
+    <Button
+        android:id="@+id/btnModel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Скачать голосовую модель (42 МБ)"
+        android:layout_marginTop="16dp" />
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Старт — слушать «Гемму»"
+        android:layout_marginTop="8dp" />
+
+    <Button
+        android:id="@+id/btnStop"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Стоп"
+        android:layout_marginTop="8dp" />
+
+    <Spinner
+        android:id="@+id/spinnerProfile"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp" />
+
+    <Button
+        android:id="@+id/btnProfileApply"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Применить профиль" />
+
+    <TextView
+        android:id="@+id/tvProfileNow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Текущий профиль: …"
+        android:textSize="13sp"
+        android:paddingTop="4dp" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:text="Готово."
+        android:textSize="15sp" />
+</LinearLayout>
