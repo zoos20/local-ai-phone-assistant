@@ -25,12 +25,19 @@ import java.util.concurrent.TimeUnit
  *                     hear (сегмент распознан на лету), reply (+confirm/
  *                     token), audio (wav ответа base64), done.
  *
+ * Транспорт (план «гибридный туннель»):
+ *  - [tunnel] == null -- прямой WS к LAN-серверу (HttpURLConnection-эпоха,
+ *    свой OkHttpClient), как раньше;
+ *  - [tunnel] != null и канал подключён -- сабстрим внутри зашифрованной
+ *    WSS-сессии туннеля (никакого второго соединения наружу).
+ *
  * До Ready кадры копятся в очереди и уходят одним потоком после ready
  * (connect обычно 10-50 мс по LAN). [ended] закрывает кадровый поток:
  * после endpoint/abort/close отправлять больше нельзя.
  */
 class VoiceStream(
     server: String,
+    private val tunnel: TunnelClient? = null,
     private val onEvent: (Event) -> Unit,
 ) {
 
@@ -69,51 +76,98 @@ class VoiceStream(
         private set
 
     private val queue = ArrayDeque<ByteArray>()
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)   // long-poll живёт вечно
-        .pingInterval(15, TimeUnit.SECONDS)
-        .build()
-
-    private val ws: WebSocket
+    // Прямой LAN-WS: свой OkHttpClient. В туннельном режиме -- null
+    // (трафик идёт сабстримом внутри канала).
+    private val client: OkHttpClient?
+    private val ws: WebSocket?
+    @Volatile
+    private var voiceHandle: TunnelClient.VoiceHandle? = null
 
     init {
-        val wsUrl = server.trimEnd('/')
-            .replaceFirst("http://", "ws://")
-            .replaceFirst("https://", "wss://") + "/ws_voice"
-        Log.i(TAG, "connect $wsUrl")
-        ws = client.newWebSocket(
-            Request.Builder().url(wsUrl).build(),
-            object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    Log.i(TAG, "open")
-                }
-
-                override fun onMessage(webSocket: WebSocket, text: String) {
+        val t = tunnel
+        if (t != null && t.isOpen()) {
+            client = null
+            ws = null
+            Log.i(TAG, "connect via tunnel")
+            voiceHandle = t.openVoice("/ws_voice", object : TunnelClient.VoiceCb {
+                override fun onText(text: String) {
                     try {
                         handle(JSONObject(text))
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "bad message: $text", t)
+                    } catch (t2: Throwable) {
+                        Log.e(TAG, "bad message: $text", t2)
                     }
                 }
 
-                override fun onFailure(
-                    webSocket: WebSocket, t: Throwable, response: Response?,
-                ) {
-                    Log.e(TAG, "failed: ${t.message}")
-                    failed = true
-                    ended = true
-                    // reply мог прийти до обрыва (до done) -- не теряем его
-                    if (!flushReply()) onEvent(Event.Failed)
+                override fun onBinary(bytes: ByteArray) {
+                    // события /ws_voice приходят текстовыми JSON-рамками
                 }
 
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    Log.i(TAG, "closed $code $reason")
+                override fun onClosed() {
+                    Log.i(TAG, "tunnel stream closed")
                     ended = true
+                    // reply мог дойти до обрыва -- не теряем его
                     flushReply()
                 }
-            },
-        )
+            })
+            if (voiceHandle == null) {
+                failed = true
+                ended = true
+            }
+        } else {
+            val wsUrl = server.trimEnd('/')
+                .replaceFirst("http://", "ws://")
+                .replaceFirst("https://", "wss://") + "/ws_voice"
+            Log.i(TAG, "connect $wsUrl")
+            val c = OkHttpClient.Builder()
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)   // long-poll живёт вечно
+                .pingInterval(15, TimeUnit.SECONDS)
+                .build()
+            client = c
+            ws = c.newWebSocket(
+                Request.Builder().url(wsUrl).build(),
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        Log.i(TAG, "open")
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        try {
+                            handle(JSONObject(text))
+                        } catch (t2: Throwable) {
+                            Log.e(TAG, "bad message: $text", t2)
+                        }
+                    }
+
+                    override fun onFailure(
+                        webSocket: WebSocket, t2: Throwable, response: Response?,
+                    ) {
+                        Log.e(TAG, "failed: ${t2.message}")
+                        failed = true
+                        ended = true
+                        // reply мог прийти до обрыва (до done) -- не теряем его
+                        if (!flushReply()) onEvent(Event.Failed)
+                    }
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        Log.i(TAG, "closed $code $reason")
+                        ended = true
+                        flushReply()
+                    }
+                },
+            )
+        }
+    }
+
+    /** Отправка кадра/текста по доступному транспорту (WS или сабстрим). */
+    private fun sendNow(frame: ByteArray) {
+        val h = voiceHandle
+        if (h != null) h.sendBinary(frame) else ws?.send(frame.toByteString())
+    }
+
+    private fun sendNowText(text: String) {
+        val h = voiceHandle
+        if (h != null) h.sendText(text) else ws?.send(text)
     }
 
     // Сервер шлёт reply, ПОТОМ audio (синтез), потом done: события Reply
@@ -143,10 +197,10 @@ class VoiceStream(
         when (msg.optString("event")) {
             "ready" -> {
                 synchronized(queue) {
-                    preMsg?.let { ws.send(it.toByteString()) }
+                    preMsg?.let { sendNow(it) }
                     preMsg = null
                     while (queue.isNotEmpty()) {
-                        ws.send(queue.poll()!!.toByteString())
+                        sendNow(queue.poll()!!)
                     }
                     ready = true
                 }
@@ -191,7 +245,7 @@ class VoiceStream(
         if (ended || failed) return
         synchronized(queue) {
             if (ready) {
-                ws.send(frame.toByteString())
+                sendNow(frame)
             } else {
                 if (queue.size >= MAX_QUEUED) queue.poll()
                 queue.add(frame)
@@ -202,14 +256,14 @@ class VoiceStream(
     fun end() {
         if (failed) return
         ended = true
-        ws.send("""{"event":"end"}""")
+        sendNowText("""{"event":"end"}""")
     }
 
     /** Стоп-слово: прерываем сессию, сервер НЕ отвечает. */
     fun abort() {
         ended = true
         try {
-            ws.send("""{"event":"abort"}""")
+            sendNowText("""{"event":"abort"}""")
         } catch (_: Exception) {
         }
         close()
@@ -218,9 +272,13 @@ class VoiceStream(
     fun close() {
         ended = true
         try {
-            ws.close(1000, "bye")
+            voiceHandle?.close()
+            ws?.close(1000, "bye")
         } catch (_: Exception) {
         }
-        client.dispatcher.executorService.shutdown()
+        try {
+            client?.dispatcher?.executorService?.shutdown()
+        } catch (_: Exception) {
+        }
     }
 }

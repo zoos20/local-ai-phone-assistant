@@ -1,6 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
+websockets>=13  # клиент WS внутри туннеля (зачастую уже стоит с uvicorn[standard])
+cryptography>=42  # генерация самоподписанного сертификата туннеля (scripts/gen-cert.py)
 pydantic==2.10.4
 pydantic-settings==2.7.1
 ddgs==9.14.0

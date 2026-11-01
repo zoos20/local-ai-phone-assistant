@@ -46,6 +46,22 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8090
 
+    # --- Доступ из интернета (гибридный туннель, план «туннель») ---
+    # Общий секрет: проверяется на ВСЕХ HTTP-эндпоинтах 8090 в заголовке
+    # X-Gemma-Token (кроме /health и /cert) и при открытии канала туннеля.
+    # Пусто = проверка выключена (прежний режим только LAN); туннель при
+    # пустом токене соединения не принимает (наружу без секрета не работаем).
+    api_token: str = ""
+    # Туннель-сервер tunnel.py: wss://<ddns>:<tunnel_port>/tunnel
+    tunnel_host: str = "0.0.0.0"
+    tunnel_port: int = 8443
+    # Самоподписанный сертификат (создаётся автоматически при старте)
+    tunnel_cert: str = str(BASE_DIR / "data" / "tunnel_cert.pem")
+    tunnel_key: str = str(BASE_DIR / "data" / "tunnel_key.pem")
+    # DDNS: AAAA-запись ПК, её обновляет scripts/ddns-update.ps1 (dynv6)
+    ddns_hostname: str = ""     # напр. mypc.dynv6.net
+    ddns_token: str = ""        # токен dynv6 (https://dynv6.com -> API)
+
     # --- Поведение ---
     # Сколько секунд живёт запрос на подтверждение (отправка/поиск).
     # На телефоне окно прямого слушания CONFIRM_MS=25 с + ~5 с озвучки

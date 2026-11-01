@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Гемма — главный экран. Стиль по референсу (см. Qwen_00024): лавандовый фон,
      рябь-кольца, стеклянные карточки, градиентные кнопки кристалла.
-     Все id и порядок элементов сохранены — логика MainActivity.kt не меняется. -->
+     Карточка адреса сервера (IP/DDNS/токен/пин) переехала в экран
+     «Настройки» (activity_settings.xml, шестерёнка в шапке). -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
@@ -16,7 +17,7 @@
         android:orientation="vertical"
         android:padding="24dp">
 
-        <!-- Шапка: логотип-кристалл + название -->
+        <!-- Шапка: логотип-кристалл + название + меню настроек -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -38,38 +39,21 @@
                 android:textColor="@color/text_primary"
                 android:textSize="24sp"
                 android:textStyle="bold" />
-        </LinearLayout>
 
-        <!-- Адрес сервера. elevation поднимает карточку по Z-порядку над рябью
-             кнопки — кольца уходят под карточку, она выглядит непрозрачной,
-             как карточка «Характер ассистента» -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="@drawable/bg_card"
-            android:elevation="6dp"
-            android:orientation="vertical"
-            android:padding="16dp">
+            <View
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
 
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Адрес сервера (ПК)"
-                android:textColor="@color/text_secondary"
-                android:textSize="13sp" />
-
-            <EditText
-                android:id="@+id/serverUrl"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:background="@drawable/bg_input"
-                android:hint="http://192.168.1.100:8090"
-                android:inputType="textUri"
-                android:padding="12dp"
-                android:textColor="@color/text_primary"
-                android:textColorHint="@color/text_secondary"
-                android:textSize="15sp" />
+            <!-- Меню настроек: адрес сервера, DDNS, токен, пин -->
+            <ImageButton
+                android:id="@+id/btnSettings"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Настройки"
+                android:padding="10dp"
+                android:src="@drawable/ic_settings" />
         </LinearLayout>
 
         <!-- Прогресс автоустановки модели из APK (виден только при первом запуске) -->
@@ -78,7 +62,6 @@
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
             android:layout_height="8dp"
-            android:layout_marginTop="16dp"
             android:max="100"
             android:progress="0"
             android:progressDrawable="@drawable/bg_progress_fill"
@@ -86,14 +69,16 @@
 
         <!-- Круглый тумблер Старт/Стоп: динамическое состояние + пульс-анимация.
              Держатель 160dp даёт запас под масштаб 1.05 (пульс), чтобы круг
-             нигде не срезался; рябь центрируется строго по кнопке -->
-        <!-- Единый ритм отступов: зазор от карты сервера до круга = зазор от
+             нигде не срезался; рябь центрируется строго по кнопке.
+             Раньше сверху была карточка адреса сервера, она переехала в
+             экран «Настройки» (шестерёнка в шапке), отступы пересчитаны. -->
+        <!-- Единый ритм отступов: зазор от шапки до круга = зазор от
              круга до подсказки = зазор от подсказки до карты профилей = 24dp
              (держатель 160dp даёт кругу ещё 14dp внутреннего запаса) -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="4dp"
             android:clipChildren="false"
             android:gravity="center_horizontal"
             android:orientation="vertical">

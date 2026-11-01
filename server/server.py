@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import llm
@@ -41,7 +41,7 @@ _HISTORY_STAMP: float = 0.0
 _HISTORY_LOCK = asyncio.Lock()
 
 # Логи и в консоль, и в файл -- чтобы видеть транскрипты с телефона,
-# когда консоль недоступна (E:\assistant\server.log).
+# когда консоль недоступна (server.log рядом с модулем).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -54,6 +54,33 @@ logging.basicConfig(
 log = logging.getLogger("assistant")
 
 app = FastAPI(title="Gemma voice assistant", version="0.1.0")
+
+
+# --------------------------------------------------------------------------
+# Токен API (доступ из интернета, план «гибридный туннель»): проверяем
+# заголовок X-Gemma-Token на всех HTTP-эндпоинтах, кроме /health (health-
+# check скриптов/фаервола) и /cert (отдаёт пин сертификата для TOFU на
+# телефоне — там пина ещё нет, а секрета в нём нет). Пустой
+# ASSISTANT_API_TOKEN = проверка выключена (прежний режим только LAN).
+#
+# WebSocket /ws_voice мидлварем НЕ оборачивается (Starlette пропускает ws
+# мимо http-мидлвари): закрыт он фаерволом (LAN-only), а по туннелу идёт
+# внутри защищённого канала 8443, который авторизует сам.
+# --------------------------------------------------------------------------
+_TOKEN_EXEMPT = {"/health", "/cert"}
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    token = settings.api_token
+    if token and request.url.path not in _TOKEN_EXEMPT:
+        got = request.headers.get("X-Gemma-Token", "")
+        if not secrets.compare_digest(got, token):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "bad or missing X-Gemma-Token"},
+            )
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------------
@@ -1052,6 +1079,30 @@ async def health() -> dict[str, Any]:
             "stt_model": settings.whisper_model,
             "tts_engine": settings.tts_engine,
             "tts_voice": settings.tts_voice if tts_mod.is_available() else None}
+
+
+# --------------------------------------------------------------------------
+# /cert -- SHA-256 сертификата туннеля для пиннинга на телефоне (TOFU):
+# приложение берёт его по LAN (телефон дома) и вшивает в CertificatePinner,
+# дальше туннель принимается только «своим» сертификатом.
+# --------------------------------------------------------------------------
+@app.get("/cert")
+async def cert_fingerprint() -> dict[str, Any]:
+    import importlib.util as _ilu
+
+    cert_path = Path(settings.tunnel_cert)
+    if not cert_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="сертификат туннеля не создан: запусти tunnel.py "
+                   "или scripts/gen-cert.py",
+        )
+    spec = _ilu.spec_from_file_location(
+        "gemma_gen_cert", Path(__file__).parent / "scripts" / "gen-cert.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    hexs, pin = mod.cert_fingerprint(cert_path)
+    return {"fingerprint_sha256": hexs, "pin": pin, "file": str(cert_path)}
 
 
 # Keep-alive llama (фаза 6): первый запрос после простоя >3 мин отвечает

@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.View
 import android.view.animation.AlphaAnimation
 import android.view.animation.Animation
@@ -14,7 +15,6 @@ import android.view.animation.AnimationSet
 import android.view.animation.ScaleAnimation
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.Spinner
@@ -30,20 +30,18 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        private const val TAG = "MainActivity"
         // Модель Vosk встроена в APK (assets) — ставится один раз при первом
         // запуске, без сети. Лицензия модели Apache 2.0 (см. *-LICENSE.txt).
         private const val MODEL_ASSET = "vosk-model-small-ru-0.22.zip"
         private const val MODEL_DIR = "vosk-model-small-ru-0.22"
         private const val PERM_AUDIO = 101
         private const val PERM_NOTIF = 102
-        private const val PREFS = "gemma"
-        private const val KEY_SERVER = "server"
         // период опроса GET /profile: голосовая команда меняет профиль на
         // сервере -> экран подхватывает смену сам (динамичный список)
         private const val PROFILE_SYNC_MS = 3000L
     }
 
-    private lateinit var serverUrl: EditText
     private lateinit var tvStatus: TextView
     private lateinit var btnToggle: Button
     private lateinit var tvToggleHint: TextView
@@ -77,14 +75,28 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        serverUrl = findViewById(R.id.serverUrl)
         tvStatus = findViewById(R.id.tvStatus)
         progressModel = findViewById(R.id.progressModel)
 
-        serverUrl.setText(
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getString(KEY_SERVER, "http://192.168.1.100:8090")
-        )
+        // Настройки подключения (адрес/DDNS/токен/пин) живут в SharedPreferences
+        // через Settings и редактируются на отдельном экране (шестерёнка в шапке)
+        ServerClient.token = Settings.apiToken(this)
+
+        // Статус канала в UI: при живом сервисе показываем переподключение
+        // (обрыв сети) и возврат канала (план «гибридный туннель»)
+        TunnelClient.setOnStateListener { st ->
+            uiHandler.post {
+                if (!AssistantService.isRunning) return@post
+                when (st) {
+                    TunnelClient.State.RECONNECTING ->
+                        setStatus("🔄 Переподключение туннеля…")
+                    TunnelClient.State.CONNECTED ->
+                        setStatus("🌐 Из интернета — туннель подключён.",
+                            R.color.status_ok)
+                    else -> Unit
+                }
+            }
+        }
 
         btnToggle = findViewById(R.id.btnToggle)
         tvToggleHint = findViewById(R.id.tvToggleHint)
@@ -100,6 +112,11 @@ class MainActivity : AppCompatActivity() {
         tvProfileNow = findViewById(R.id.tvProfileNow)
         btnProfileApply.setOnClickListener { applySelectedProfile() }
 
+        // Меню настроек: адрес сервера, DDNS, токен, пин (отдельный экран)
+        findViewById<View>(R.id.btnSettings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         // Material-стиль кнопок перекрашивает background заливкой colorPrimary —
         // сбрасываем тинт, чтобы виден остался кастомный градиент/контур
         intArrayOf(R.id.btnToggle, R.id.btnProfileApply)
@@ -112,14 +129,50 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // вернулись из настроек -> токен/адрес могли измениться
+        ServerClient.token = Settings.apiToken(this)
         updateToggle()
         syncProfileFromServer()
         uiHandler.postDelayed(profileSync, PROFILE_SYNC_MS)
+        refreshPinIfHome()
     }
 
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(profileSync)
+    }
+
+    /**
+     * TOFU-обновление пина при открытии приложения: если телефон дома (ПК
+     * отвечает по LAN) -- забираем актуальный пин сертификата из GET /cert.
+     * Так пин обновляется автоматически, даже если пользователь не нажимает
+     * Старт: сертификат перегенерировался -> при следующем выходе из дома
+     * туннель поднимется со свежим пином, а не с устаревшим.
+     */
+    private fun refreshPinIfHome() {
+        val server = currentServer()
+        if (server.isEmpty()) return
+        thread {
+            try {
+                if (!ServerClient.healthDirect(server, 1500)) return@thread
+                val p = ServerClient.certDirect(server, 2500)
+                    .optString("pin")
+                if (p.isNotBlank() &&
+                    Settings.setTunnelPinIfChanged(this, p)
+                ) {
+                    Log.i(TAG, "TOFU: cert pin auto-refreshed on resume")
+                    TunnelClient.updatePin(p)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this, "Пин сертификата обновлён",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            } catch (_: Throwable) {
+                // ПК недоступен / сеть не та -- просто пропускаем
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -249,8 +302,8 @@ class MainActivity : AppCompatActivity() {
     //     POST /profile. Пока не применено, опрос выбор НЕ сбрасывает
     //     (трекаем currentProfileId = применённый на сервере).
     // ------------------------------------------------------------------
-    private fun currentServer(): String =
-        serverUrl.text.toString().trim().trimEnd('/')
+    /** Адрес сервера из настроек (экран «Настройки»). */
+    private fun currentServer(): String = Settings.serverUrl(this)
 
     /** Опрос сервера: подстроить список/текущий под состояние сервера. */
     private fun syncProfileFromServer() {
@@ -412,6 +465,15 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------------
     // Сервис
     // ------------------------------------------------------------------
+    /**
+     * Общий Старт (план «гибридный туннель»):
+     *  1) пинг LAN /health (1.5 с) -> «дома»: пошли сервис по LAN и тут же
+     *     забрали пин сертификата туннеля (TOFU: GET /cert, пока телефон
+     *     дома -- дальше пин не поменяется без перегенерации на ПК);
+     *  2) LAN молчит -> поднимаем канал по DDNS (wss://<домен>:8443/tunnel)
+     *     и проверяем /health УЖЕ через канал;
+     *  3) стартуем сервис; Стоп = остановить сервис + закрыть канал.
+     */
     private fun startAssistant() {
         if (requestPermissionsNeeded()) {
             setStatus("Сначала дайте разрешения.", R.color.status_error)
@@ -426,23 +488,96 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val server = serverUrl.text.toString().trim().trimEnd('/')
+        val server = currentServer()
         if (server.isEmpty()) {
-            setStatus("Укажите адрес сервера.", R.color.status_error)
+            setStatus("Укажите адрес сервера (⚙ в шапке).", R.color.status_error)
             return
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString(KEY_SERVER, server).apply()
+        // Настройки редактируются на отдельном экране (⚙) -- здесь только читаем
+        val host = Settings.tunnelHost(this)
+        val token = Settings.apiToken(this)
+        ServerClient.token = token
 
-        val intent = Intent(this, AssistantService::class.java)
-            .putExtra(AssistantService.EXTRA_SERVER, server)
-        ContextCompat.startForegroundService(this, intent)
-        setStatus("Сервис запущен. Скажите «Гемма».", R.color.status_ok)
-        Toast.makeText(this, "Ассистент слушает", Toast.LENGTH_SHORT).show()
+        btnToggle.isEnabled = false
+        setStatus("Проверяю связь с ПК…")
+        thread {
+            var mode = ""
+            if (ServerClient.healthDirect(server, 1500)) {
+                mode = "lan"
+                // TOFU: пока телефон дома -- забираем АКТУАЛЬНЫЙ пин через
+                // GET /cert. Делаем это ВСЕГДА, а не только при пустом пине:
+                // сертификат мог перегенерироваться (новое DDNS-имя и т.п.),
+                // и устаревший пин молча ломает туннель вне дома.
+                try {
+                    val p = ServerClient.certDirect(server)
+                        .optString("pin")
+                    if (p.isNotBlank()) {
+                        val changed = Settings.setTunnelPinIfChanged(this, p)
+                        if (changed) {
+                            Log.i(TAG, "TOFU: cert pin updated from /cert")
+                            // если канал уже крутится со старым пином --
+                            // следующая попытка возьмёт новый (без рестарта)
+                            TunnelClient.updatePin(p)
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // без пина туннель не поднимется -- сообщим при Старте
+                }
+            } else if (host.isNotEmpty()) {
+                // вне дома пин не обновить (нужен LAN) -- берём хранимый
+                val storedPin = Settings.tunnelPin(this)
+                if (storedPin.isEmpty()) {
+                    runOnUiThread {
+                        setStatus(
+                            "⛔ Нет пина сертификата: открой настройки (⚙) " +
+                                    "дома и нажми Старт (или введи пин).",
+                            R.color.status_error,
+                        )
+                        btnToggle.isEnabled = true
+                    }
+                    return@thread
+                }
+                runOnUiThread { setStatus("Дома недоступен — поднимаю туннель…") }
+                val started = TunnelClient.start(host, storedPin, token)
+                if (started && TunnelClient.awaitConnected(15_000) &&
+                    ServerClient.health(server, 5_000)
+                ) {
+                    mode = "tunnel"
+                }
+            }
+            runOnUiThread {
+                btnToggle.isEnabled = true
+                if (mode.isEmpty()) {
+                    val reason = when {
+                        TunnelClient.isPinMismatch() ->
+                            "Пин сертификата устарел — открой приложение " +
+                                    "дома и нажми Старт (пин обновится сам)."
+                        TunnelClient.lastErrorText().isNotEmpty() ->
+                            "Туннель: ${TunnelClient.lastErrorText()}"
+                        else ->
+                            "сеть без IPv6 или ПК недоступен"
+                    }
+                    setStatus("⛔ Нет связи: $reason", R.color.status_error)
+                    return@runOnUiThread
+                }
+                val intent = Intent(this, AssistantService::class.java)
+                    .putExtra(AssistantService.EXTRA_SERVER, server)
+                ContextCompat.startForegroundService(this, intent)
+                setStatus(
+                    if (mode == "lan") "🏠 Дома (LAN) — скажите «Гемма»."
+                    else "🌐 Из интернета — туннель подключён.",
+                    R.color.status_ok,
+                )
+                Toast.makeText(this, "Ассистент слушает", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun stopAssistant() {
         stopService(Intent(this, AssistantService::class.java))
+        // Канал закрывается и в onDestroy сервиса; здесь -- сразу, чтобы
+        // соединение не висело до завершения сервиса
+        TunnelClient.close()
         setStatus("Сервис остановлен.")
     }
 }

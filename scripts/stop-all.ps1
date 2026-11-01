@@ -4,11 +4,12 @@
       1. llama-server (LLM, port 8080)
       2. assistant API (FastAPI, port 8090)
       3. kokoro-ru TTS sidecar (port 8091)
+      4. tunnel (wss, port 8443)
 
     Processes are found by command line (llama-server.exe, server.py,
-    tts_kokoro_server.py), NOT by port alone -- other local services that
-    happen to use the same ports are never touched. Stray duplicates of
-    server.py / tts_kokoro_server.py are stopped too.
+    tts_kokoro_server.py, tunnel.py), NOT by port alone -- other local
+    services that happen to use the same ports are never touched. Stray
+    duplicates of server.py / tts_kokoro_server.py are stopped too.
 
     Idempotent: things that are not running are reported as "not running".
     Run with -WhatIf to see what would be stopped without stopping it.
@@ -52,6 +53,9 @@ Stop-Matching 'assistant API (8090)' 'python.exe' '(^|[\s"\\])server\.py\s*$'
 # 3. kokoro TTS sidecar
 Stop-Matching 'kokoro TTS (8091)' 'python.exe' 'tts_kokoro_server\.py'
 
+# 4. tunnel (wss 8443)
+Stop-Matching 'tunnel (8443)' 'python.exe' 'tunnel\.py'
+
 if ($WhatIf) {
     Write-Host '[stop] what-if mode -- nothing was stopped'
     exit 0
@@ -59,7 +63,7 @@ if ($WhatIf) {
 
 # Give the OS a moment, then report which ports are actually free.
 Start-Sleep -Seconds 1
-foreach ($port in 8080, 8090, 8091) {
+foreach ($port in 8080, 8090, 8091, 8443) {
     $left = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
     if ($left) {
         $owner = ($left | Select-Object -First 1).OwningProcess

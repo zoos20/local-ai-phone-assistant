@@ -310,6 +310,9 @@ class AssistantService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        // Токен API живёт в Settings: при рестарте процесса системой
+        // (START_STICKY) MainActivity может не быть -- подхватываем сами
+        ServerClient.token = Settings.apiToken(this)
         // BT-наушники: слушаем подключение/отключение и переключаем
         // микрофон (иначе ассистент через них не слышит)
         audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager
@@ -321,8 +324,10 @@ class AssistantService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // intent == null: системный рестарт (START_STICKY) -- адрес берём
+        // из настроек, а не с хардкода
         server = intent?.getStringExtra(EXTRA_SERVER)
-            ?: "http://192.168.1.100:8090"
+            ?: Settings.serverUrl(this)
         isRunning = true
 
         startForegroundCompat()
@@ -348,6 +353,9 @@ class AssistantService : Service() {
         state = State.STOPPED
         audioThread?.join(2000)
         audioThread = null
+        // Стоп сервиса == Стоп туннеля (лifecycle канала привязан к сервису,
+        // план «гибридный туннель»): канал закрывается, реконнект прекращается
+        TunnelClient.close()
         // BT-аудио: снимаем обработчик и возвращаем системное маршрутизирование
         try {
             audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
@@ -1586,7 +1594,10 @@ class AssistantService : Service() {
             chunkQueue.clear()
             chunkStreamDone = false
         }
-        voiceStream = VoiceStream(server) { ev ->
+        // Туннель (план «гибридный туннель»): канал подключён -> голосовой
+        // поток идёт сабстримом внутри WSS-сессии, иначе -- прямой WS по LAN
+        val tunnel = if (TunnelClient.isOpen()) TunnelClient else null
+        voiceStream = VoiceStream(server, tunnel) { ev ->
             when (ev) {
                 is VoiceStream.Event.Ready ->
                     Log.i(TAG, "stream ready")
