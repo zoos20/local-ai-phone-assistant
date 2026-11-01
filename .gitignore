@@ -3,6 +3,9 @@
 active_profile.txt
 *.log
 
+# --- локальная документация (не публикуется) ---
+ARCHITECTURE.md
+
 # --- python ---
 __pycache__/
 *.py[cod]
