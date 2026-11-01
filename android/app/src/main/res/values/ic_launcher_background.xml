@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Светло-лиловый фон adaptive-иконки (цвет ряби вокруг кристалла) -->
+    <color name="ic_launcher_background">#F2F1F6</color>
+</resources>
