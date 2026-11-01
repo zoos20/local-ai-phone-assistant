@@ -1,78 +1,206 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- Гемма — главный экран. Стиль по референсу (см. Qwen_00024): лавандовый фон,
+     рябь-кольца, стеклянные карточки, градиентные кнопки кристалла.
+     Все id и порядок элементов сохранены — логика MainActivity.kt не меняется. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="24dp">
+    android:background="@color/bg_app"
+    android:clipChildren="false">
 
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Гемма — голосовой ассистент"
-        android:textSize="20sp"
-        android:textStyle="bold"
-        android:paddingBottom="16dp" />
+        android:layout_height="match_parent"
+        android:clipChildren="false"
+        android:orientation="vertical"
+        android:padding="24dp">
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Адрес сервера (ПК):"
-        android:textSize="13sp" />
+        <!-- Шапка: логотип-кристалл + название -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="20dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-    <EditText
-        android:id="@+id/serverUrl"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="http://192.168.1.100:8090"
-        android:inputType="textUri"
-        android:textSize="15sp" />
+            <ImageView
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:contentDescription="@string/app_name"
+                android:src="@drawable/ic_launcher_foreground" />
 
-    <Button
-        android:id="@+id/btnModel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Скачать голосовую модель (42 МБ)"
-        android:layout_marginTop="16dp" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:text="@string/app_name"
+                android:textColor="@color/text_primary"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+        </LinearLayout>
 
-    <Button
-        android:id="@+id/btnStart"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Старт — слушать «Гемму»"
-        android:layout_marginTop="8dp" />
+        <!-- Адрес сервера. elevation поднимает карточку по Z-порядку над рябью
+             кнопки — кольца уходят под карточку, она выглядит непрозрачной,
+             как карточка «Характер ассистента» -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_card"
+            android:elevation="6dp"
+            android:orientation="vertical"
+            android:padding="16dp">
 
-    <Button
-        android:id="@+id/btnStop"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Стоп"
-        android:layout_marginTop="8dp" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Адрес сервера (ПК)"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
 
-    <Spinner
-        android:id="@+id/spinnerProfile"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="16dp" />
+            <EditText
+                android:id="@+id/serverUrl"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:background="@drawable/bg_input"
+                android:hint="http://192.168.1.100:8090"
+                android:inputType="textUri"
+                android:padding="12dp"
+                android:textColor="@color/text_primary"
+                android:textColorHint="@color/text_secondary"
+                android:textSize="15sp" />
+        </LinearLayout>
 
-    <Button
-        android:id="@+id/btnProfileApply"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Применить профиль" />
+        <!-- Прогресс автоустановки модели из APK (виден только при первом запуске) -->
+        <ProgressBar
+            android:id="@+id/progressModel"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="8dp"
+            android:layout_marginTop="16dp"
+            android:max="100"
+            android:progress="0"
+            android:progressDrawable="@drawable/bg_progress_fill"
+            android:visibility="gone" />
 
-    <TextView
-        android:id="@+id/tvProfileNow"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Текущий профиль: …"
-        android:textSize="13sp"
-        android:paddingTop="4dp" />
+        <!-- Круглый тумблер Старт/Стоп: динамическое состояние + пульс-анимация.
+             Держатель 160dp даёт запас под масштаб 1.05 (пульс), чтобы круг
+             нигде не срезался; рябь центрируется строго по кнопке -->
+        <!-- Единый ритм отступов: зазор от карты сервера до круга = зазор от
+             круга до подсказки = зазор от подсказки до карты профилей = 24dp
+             (держатель 160dp даёт кругу ещё 14dp внутреннего запаса) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:clipChildren="false"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
 
-    <TextView
-        android:id="@+id/tvStatus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="20dp"
-        android:text="Готово."
-        android:textSize="15sp" />
-</LinearLayout>
+            <FrameLayout
+                android:layout_width="160dp"
+                android:layout_height="160dp"
+                android:clipChildren="false">
+
+                <!-- Рябь вокруг кнопки — пульсирует только когда ассистент слушает -->
+                <ImageView
+                    android:id="@+id/ripples"
+                    android:layout_width="360dp"
+                    android:layout_height="360dp"
+                    android:layout_gravity="center"
+                    android:importantForAccessibility="no"
+                    android:src="@drawable/bg_ripples"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/btnToggle"
+                    android:layout_width="132dp"
+                    android:layout_height="132dp"
+                    android:layout_gravity="center"
+                    android:background="@drawable/bg_toggle_idle"
+                    android:backgroundTint="@null"
+                    android:minHeight="0dp"
+                    android:stateListAnimator="@null"
+                    android:text="Старт"
+                    android:textAllCaps="false"
+                    android:textColor="@color/crystal_mid"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/tvToggleHint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Нажмите, чтобы запустить"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- Профили характера -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:background="@drawable/bg_card"
+            android:elevation="6dp"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Характер ассистента"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <Spinner
+                android:id="@+id/spinnerProfile"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_spinner"
+                android:minHeight="52dp"
+                android:paddingStart="16dp"
+                android:paddingTop="14dp"
+                android:paddingEnd="44dp"
+                android:paddingBottom="14dp" />
+
+            <Button
+                android:id="@+id/btnProfileApply"
+                style="@style/Widget.Gemma.Button.Filled"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="Применить профиль"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/tvProfileNow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="6dp"
+                android:text="Текущий профиль: …"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <!-- Статус сервиса -->
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="Готово."
+            android:textColor="@color/status_idle"
+            android:textSize="14sp" />
+    </LinearLayout>
+</FrameLayout>

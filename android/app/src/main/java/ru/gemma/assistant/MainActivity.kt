@@ -1,33 +1,38 @@
 package ru.gemma.assistant
 
 import android.Manifest
-import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.View
+import android.view.animation.AlphaAnimation
+import android.view.animation.Animation
+import android.view.animation.AnimationSet
+import android.view.animation.ScaleAnimation
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
+import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val MODEL_URL =
-            "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+        // Модель Vosk встроена в APK (assets) — ставится один раз при первом
+        // запуске, без сети. Лицензия модели Apache 2.0 (см. *-LICENSE.txt).
+        private const val MODEL_ASSET = "vosk-model-small-ru-0.22.zip"
         private const val MODEL_DIR = "vosk-model-small-ru-0.22"
         private const val PERM_AUDIO = 101
         private const val PERM_NOTIF = 102
@@ -40,10 +45,13 @@ class MainActivity : Activity() {
 
     private lateinit var serverUrl: EditText
     private lateinit var tvStatus: TextView
-    private lateinit var btnModel: Button
+    private lateinit var btnToggle: Button
+    private lateinit var tvToggleHint: TextView
+    private lateinit var ripples: ImageView
     private lateinit var spinnerProfile: Spinner
     private lateinit var btnProfileApply: Button
     private lateinit var tvProfileNow: TextView
+    private lateinit var progressModel: ProgressBar
 
     // Профили общения: список с сервера + текущий. Сервер -- источник
     // истины: голосовая команда меняет профиль на сервере, а этот экран
@@ -56,12 +64,14 @@ class MainActivity : Activity() {
     private val profileSync = object : Runnable {
         override fun run() {
             syncProfileFromServer()
+            // тумблер подхватывает статус, если сервис убит/запущен не отсюда
+            updateToggle()
             uiHandler.postDelayed(this, PROFILE_SYNC_MS)
         }
     }
 
     private val modelDir: File get() = File(filesDir, MODEL_DIR)
-    private var downloading = false
+    private var installing = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,28 +79,40 @@ class MainActivity : Activity() {
 
         serverUrl = findViewById(R.id.serverUrl)
         tvStatus = findViewById(R.id.tvStatus)
-        btnModel = findViewById(R.id.btnModel)
+        progressModel = findViewById(R.id.progressModel)
 
         serverUrl.setText(
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getString(KEY_SERVER, "http://192.168.1.100:8090")
         )
 
-        btnModel.setOnClickListener { downloadModel() }
-        findViewById<Button>(R.id.btnStart).setOnClickListener { startAssistant() }
-        findViewById<Button>(R.id.btnStop).setOnClickListener { stopAssistant() }
+        btnToggle = findViewById(R.id.btnToggle)
+        tvToggleHint = findViewById(R.id.tvToggleHint)
+        ripples = findViewById(R.id.ripples)
+        btnToggle.setOnClickListener {
+            if (AssistantService.isRunning) stopAssistant() else startAssistant()
+            updateToggle()
+            // сервис стартует/останавливается асинхронно — перерисовка после гонки
+            btnToggle.postDelayed({ updateToggle() }, 400)
+        }
         spinnerProfile = findViewById(R.id.spinnerProfile)
         btnProfileApply = findViewById(R.id.btnProfileApply)
         tvProfileNow = findViewById(R.id.tvProfileNow)
         btnProfileApply.setOnClickListener { applySelectedProfile() }
 
-        refreshModelButton()
+        // Material-стиль кнопок перекрашивает background заливкой colorPrimary —
+        // сбрасываем тинт, чтобы виден остался кастомный градиент/контур
+        intArrayOf(R.id.btnToggle, R.id.btnProfileApply)
+            .forEach { findViewById<Button>(it).backgroundTintList = null }
+
+        ensureModelInstalled()
+        updateToggle()
         requestPermissionsIfNeeded()
     }
 
     override fun onResume() {
         super.onResume()
-        refreshModelButton()
+        updateToggle()
         syncProfileFromServer()
         uiHandler.postDelayed(profileSync, PROFILE_SYNC_MS)
     }
@@ -132,7 +154,7 @@ class MainActivity : Activity() {
 
     private fun requestPermissionsIfNeeded() {
         if (requestPermissionsNeeded()) {
-            tvStatus.text = "Нужны разрешения: микрофон, уведомления, контакты, звонки."
+            setStatus("Нужны разрешения: микрофон, уведомления, контакты, звонки.")
         }
     }
 
@@ -141,9 +163,9 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            tvStatus.text = "Разрешения получены."
+            setStatus("Разрешения получены.", R.color.status_ok)
         } else {
-            tvStatus.text = "Без микрофонного разрешения ассистент не работает."
+            setStatus("Без микрофонного разрешения ассистент не работает.", R.color.status_error)
         }
     }
 
@@ -153,44 +175,32 @@ class MainActivity : Activity() {
     private fun modelReady(): Boolean =
         modelDir.exists() && File(modelDir, "am").exists()
 
-    private fun refreshModelButton() {
-        btnModel.text = if (modelReady()) "Модель установлена ✓" else
-            "Скачать голосовую модель (42 МБ)"
-        btnModel.isEnabled = !modelReady() && !downloading
+    /** Статусная строка с цветом (по референсу: серый — ожидание, зелёный — ок, розовый — ошибка). */
+    private fun setStatus(text: String, color: Int = R.color.status_idle) {
+        tvStatus.text = text
+        tvStatus.setTextColor(ContextCompat.getColor(this, color))
     }
 
-    private fun downloadModel() {
-        if (downloading) return
-        downloading = true
-        btnModel.isEnabled = false
-        tvStatus.text = "Скачиваю модель Vosk…"
-
+    /**
+     * Модель встроена в APK (assets): при первом запуске распаковывается в
+     * filesDir, дальше просто открывается. Кнопки и сети больше нет.
+     */
+    private fun ensureModelInstalled() {
+        if (modelReady() || installing) return
+        installing = true
+        progressModel.visibility = View.VISIBLE
+        progressModel.progress = 0
+        setStatus("Устанавливаю голосовую модель из приложения…")
         thread {
-            val zipFile = File(cacheDir, "vosk-model.zip")
             try {
-                val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
-                conn.connectTimeout = 30000
-                conn.readTimeout = 120000 // 42 МБ по слабому Wi-Fi — не рвем
-                val total = conn.contentLength.toLong()
-                var downloaded = 0L
-                conn.inputStream.use { input ->
-                    FileOutputStream(zipFile).use { out ->
-                        val buf = ByteArray(64 * 128)
-                        while (true) {
-                            val r = input.read(buf)
-                            if (r <= 0) break
-                            out.write(buf, 0, r)
-                            downloaded += r
-                            if (total > 0 && downloaded % (2L * 1024 * 1024) < 65536) {
-                                val pct = downloaded * 100 / total
-                                runOnUiThread { tvStatus.text = "Скачивание: $pct%" }
-                            }
-                        }
-                    }
+                // предподсчёт записей — чтобы показать проценты распаковки
+                val total = ZipInputStream(assets.open(MODEL_ASSET).buffered()).use { z ->
+                    var n = 0
+                    while (z.nextEntry != null) n++
+                    n
                 }
-
-                runOnUiThread { tvStatus.text = "Распаковка модели…" }
-                ZipInputStream(zipFile.inputStream().buffered()).use { zip ->
+                var done = 0
+                ZipInputStream(assets.open(MODEL_ASSET).buffered()).use { zip ->
                     var entry = zip.nextEntry
                     while (entry != null) {
                         val dest = File(filesDir, entry.name)
@@ -200,25 +210,32 @@ class MainActivity : Activity() {
                             dest.parentFile?.mkdirs()
                             dest.outputStream().use { zip.copyTo(it) }
                         }
+                        done++
+                        if (done % 2 == 0 || done == total) {
+                            val pct = if (total > 0) done * 100 / total else 0
+                            runOnUiThread {
+                                progressModel.progress = pct
+                                setStatus("Установка модели: $pct%")
+                            }
+                        }
                         entry = zip.nextEntry
                     }
                 }
-                zipFile.delete()
-
                 runOnUiThread {
-                    tvStatus.text =
+                    progressModel.visibility = View.GONE
+                    setStatus(
                         if (modelReady()) "Модель установлена. Можно жать Старт."
-                        else "Распаковано, но модель не найдена — попробуйте ещё раз."
-                    refreshModelButton()
+                        else "Распаковано, но модель не найдена — перезапустите приложение.",
+                        if (modelReady()) R.color.status_ok else R.color.status_error
+                    )
                 }
             } catch (t: Throwable) {
-                zipFile.delete()
                 runOnUiThread {
-                    tvStatus.text = "Ошибка скачивания: ${t.message}"
-                    refreshModelButton()
+                    progressModel.visibility = View.GONE
+                    setStatus("Ошибка установки модели: ${t.message}", R.color.status_error)
                 }
             } finally {
-                downloading = false
+                installing = false
             }
         }
     }
@@ -336,21 +353,82 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // Круглый тумблер Старт/Стоп + пульс-анимации
+    // ------------------------------------------------------------------
+    /** Динамическое состояние кнопки: контур «Стоп» / градиент «Слушаю». */
+    private fun updateToggle() {
+        val active = AssistantService.isRunning
+        if (active) {
+            btnToggle.setBackgroundResource(R.drawable.bg_toggle_active)
+            btnToggle.setTextColor(ContextCompat.getColor(this, android.R.color.white))
+            btnToggle.text = "Стоп"
+            tvToggleHint.text = "Готов слушать — скажите «Гемму»"
+            startPulse()
+        } else {
+            btnToggle.setBackgroundResource(R.drawable.bg_toggle_idle)
+            btnToggle.setTextColor(ContextCompat.getColor(this, R.color.crystal_mid))
+            btnToggle.text = "Старт"
+            tvToggleHint.text = "Нажмите, чтобы запустить"
+            stopPulse()
+        }
+    }
+
+    /** Пульс кнопки + дыхание волн — СИНХРОННО: одна длительность, один ритм. */
+    private fun startPulse() {
+        if (btnToggle.animation != null) return // уже анимировано
+        val dur = 700L
+        btnToggle.startAnimation(ScaleAnimation(
+            1f, 1.05f, 1f, 1.05f,
+            Animation.RELATIVE_TO_SELF, 0.5f,
+            Animation.RELATIVE_TO_SELF, 0.5f
+        ).apply {
+            duration = dur
+            repeatMode = Animation.REVERSE
+            repeatCount = Animation.INFINITE
+            fillAfter = true
+        })
+        // кольца дышат тем же ритмом: масштаб + прозрачность одним набором
+        ripples.visibility = View.VISIBLE
+        ripples.startAnimation(AnimationSet(true).apply {
+            addAnimation(ScaleAnimation(
+                1f, 1.05f, 1f, 1.05f,
+                Animation.RELATIVE_TO_SELF, 0.5f,
+                Animation.RELATIVE_TO_SELF, 0.5f
+            ))
+            addAnimation(AlphaAnimation(0.35f, 1f))
+            duration = dur
+            repeatMode = Animation.REVERSE
+            repeatCount = Animation.INFINITE
+            fillAfter = true
+        })
+    }
+
+    private fun stopPulse() {
+        btnToggle.clearAnimation()
+        ripples.clearAnimation()
+        ripples.visibility = View.GONE
+    }
+
+    // ------------------------------------------------------------------
     // Сервис
     // ------------------------------------------------------------------
     private fun startAssistant() {
         if (requestPermissionsNeeded()) {
-            tvStatus.text = "Сначала дайте разрешения."
+            setStatus("Сначала дайте разрешения.", R.color.status_error)
+            return
+        }
+        if (installing) {
+            setStatus("Модель ещё устанавливается — подождите…")
             return
         }
         if (!modelReady()) {
-            tvStatus.text = "Сначала скачайте голосовую модель."
+            setStatus("Модель не установлена — перезапустите приложение.", R.color.status_error)
             return
         }
 
         val server = serverUrl.text.toString().trim().trimEnd('/')
         if (server.isEmpty()) {
-            tvStatus.text = "Укажите адрес сервера."
+            setStatus("Укажите адрес сервера.", R.color.status_error)
             return
         }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -359,12 +437,12 @@ class MainActivity : Activity() {
         val intent = Intent(this, AssistantService::class.java)
             .putExtra(AssistantService.EXTRA_SERVER, server)
         ContextCompat.startForegroundService(this, intent)
-        tvStatus.text = "Сервис запущен. Скажите «Гемма»."
+        setStatus("Сервис запущен. Скажите «Гемма».", R.color.status_ok)
         Toast.makeText(this, "Ассистент слушает", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopAssistant() {
         stopService(Intent(this, AssistantService::class.java))
-        tvStatus.text = "Сервис остановлен."
+        setStatus("Сервис остановлен.")
     }
 }

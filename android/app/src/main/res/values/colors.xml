@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Палитра приложения — пиксель в пиксель из иконки (ic_launcher) -->
+    <!-- Фон экрана совпадает с ic_launcher_background: экран и иконка — одно целое -->
+    <color name="bg_app">#F2F1F6</color>
+    <color name="crystal_start">#8B5CF6</color>
+    <color name="crystal_mid">#D946A6</color>
+    <color name="crystal_end">#FB7185</color>
+    <color name="text_primary">#1C1B22</color>
+    <color name="text_secondary">#6B6A75</color>
+    <color name="card_stroke">#E4E2EC</color>
+    <color name="status_ok">#2E9E6B</color>
+    <color name="status_error">#D946A6</color>
+    <color name="status_idle">#6B6A75</color>
+</resources>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Тема приложения: Material3 Light без тулбара, фон как у иконки -->
+    <style name="Theme.Gemma" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">@color/crystal_start</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/crystal_mid</item>
+        <item name="colorOnSecondary">@android:color/white</item>
+        <item name="colorTertiary">@color/crystal_end</item>
+        <item name="android:colorBackground">@color/bg_app</item>
+        <item name="colorSurface">@color/bg_app</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="android:windowBackground">@color/bg_app</item>
+        <item name="android:statusBarColor">@color/bg_app</item>
+        <item name="android:navigationBarColor">@color/bg_app</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o">true</item>
+    </style>
+
+    <!-- Базовая кнопка: без elevation-анимации, текст без CAPS (как на референсе) -->
+    <style name="Widget.Gemma.Button" parent="Widget.AppCompat.Button">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:minHeight">0dp</item>
+    </style>
+
+    <!-- Основная кнопка (Применить): градиент кристалла -->
+    <style name="Widget.Gemma.Button.Filled" parent="Widget.Gemma.Button">
+        <item name="android:background">@drawable/bg_button_gradient</item>
+        <item name="backgroundTint">@null</item>
+        <item name="android:backgroundTint">@null</item>
+        <item name="android:textColor">@android:color/white</item>
+    </style>
+</resources>

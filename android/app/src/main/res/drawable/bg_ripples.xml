@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Концентрические кольца-рябь (как вокруг кристалла в иконке) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="360dp"
+    android:height="360dp"
+    android:viewportWidth="360"
+    android:viewportHeight="360">
+
+    <!-- Тонкие окружности с очень низкой непрозрачностью — мягкая рябь -->
+    <path
+        android:pathData="M180,180 m-60,0 a60,60 0 1,1 120,0 a60,60 0 1,1 -120,0"
+        android:strokeColor="#8B5CF6"
+        android:strokeWidth="1.5"
+        android:strokeAlpha="0.10"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M180,180 m-100,0 a100,100 0 1,1 200,0 a100,100 0 1,1 -200,0"
+        android:strokeColor="#8B5CF6"
+        android:strokeWidth="1.5"
+        android:strokeAlpha="0.08"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M180,180 m-140,0 a140,140 0 1,1 280,0 a140,140 0 1,1 -280,0"
+        android:strokeColor="#D946A6"
+        android:strokeWidth="1.5"
+        android:strokeAlpha="0.07"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M180,180 m-178,0 a178,178 0 1,1 356,0 a178,178 0 1,1 -356,0"
+        android:strokeColor="#D946A6"
+        android:strokeWidth="1.5"
+        android:strokeAlpha="0.06"
+        android:fillColor="#00000000" />
+</vector>

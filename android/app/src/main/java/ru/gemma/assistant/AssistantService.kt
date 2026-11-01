@@ -60,6 +60,9 @@ class AssistantService : Service() {
         private const val TAG = "GemmaService"
         const val EXTRA_SERVER = "server"
 
+        /** Состояние сервиса для UI (MainActivity показывает Старт/Стоп динамически). */
+        @Volatile var isRunning = false
+
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_ID = "gemma_service"
         private const val NOTIFICATION_ID = 1
@@ -320,6 +323,7 @@ class AssistantService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         server = intent?.getStringExtra(EXTRA_SERVER)
             ?: "http://192.168.1.100:8090"
+        isRunning = true
 
         startForegroundCompat()
         acquireWakeLock()
@@ -340,6 +344,7 @@ class AssistantService : Service() {
 
     override fun onDestroy() {
         running = false
+        isRunning = false
         state = State.STOPPED
         audioThread?.join(2000)
         audioThread = null

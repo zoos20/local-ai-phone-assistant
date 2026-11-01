@@ -36,6 +36,9 @@ dependencies {
     // Оффлайн wake word + распознавание (русскоязычная модель качается отдельно)
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("androidx.core:core-ktx:1.13.1")
+    // тема и стили кристалла (Theme.Gemma на базе Material3) + градиенты
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     // WebSocket-стриминг аудио на сервер во время речи (фаза 6, п. 1)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

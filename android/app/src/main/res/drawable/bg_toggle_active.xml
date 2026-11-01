@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Круглая кнопка-тумблер: состояние «слушает» — градиент кристалла -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33FFFFFF">
+    <item android:id="@android:id/mask">
+        <shape android:shape="oval">
+            <solid android:color="#FFFFFFFF" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:angle="45"
+                android:startColor="@color/crystal_start"
+                android:centerColor="@color/crystal_mid"
+                android:endColor="@color/crystal_end"
+                android:type="linear" />
+        </shape>
+    </item>
+</ripple>
