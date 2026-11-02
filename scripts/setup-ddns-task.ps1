@@ -15,7 +15,10 @@ $ErrorActionPreference = 'Stop'
 $script = Join-Path $PSScriptRoot 'ddns-update.ps1'
 if (-not (Test-Path $script)) { throw "not found: $script" }
 
-$tr = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$script`""
+# conhost --headless: no console window is created at all. Plain
+# "-WindowStyle Hidden" still flashes a window under Task Scheduler,
+# because the console is allocated before PowerShell can hide it.
+$tr = "conhost.exe --headless powershell.exe -ExecutionPolicy Bypass -NoProfile -File `"$script`""
 schtasks /Create /TN 'Gemma-DDNS' /SC MINUTE /MO 5 /TR $tr /F | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "schtasks failed with code $LASTEXITCODE" }
 
