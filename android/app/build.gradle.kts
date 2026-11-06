@@ -42,4 +42,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     // WebSocket-стриминг аудио на сервер во время речи (фаза 6, п. 1)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Характеризационные юнит-тесты (распознавание, фонетика, RMS, wake)
+    testImplementation("junit:junit:4.13.2")
 }

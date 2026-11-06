@@ -1,0 +1,11 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+# Набор правил по умолчанию (E4, E7, E9, F) — расширяем отдельным PR'ом,
+# когда старые ошибки будут вычищены. Сейчас важно не менять baseline.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

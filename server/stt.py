@@ -47,8 +47,16 @@ def _save_debug(audio: bytes) -> None:
 
         d = Path(settings.stt_debug_dir)
         d.mkdir(parents=True, exist_ok=True)
-        name = f"{datetime.now():%Y%m%d_%H%M%S_%f}.wav"
-        (d / name).write_bytes(audio)
+        # Имя файла: на Windows datetime.now() даёт одинаковые значения при
+        # быстрых вызовах (гранулярность ~15 мс) -- без проверки существования
+        # второй файл затирает первый. При коллизии добавляем счётчик.
+        base = f"{datetime.now():%Y%m%d_%H%M%S_%f}"
+        p = d / f"{base}.wav"
+        n = 0
+        while p.exists():
+            n += 1
+            p = d / f"{base}_{n}.wav"
+        p.write_bytes(audio)
         # держим только последние N записей, остальное -- при чистке
         files = sorted(d.glob("*.wav"))
         for old in files[:-settings.stt_debug_keep]:

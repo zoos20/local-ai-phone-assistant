@@ -24,6 +24,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.io.File
+import java.io.IOException
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
@@ -82,6 +83,22 @@ class MainActivity : AppCompatActivity() {
         // через Settings и редактируются на отдельном экране (шестерёнка в шапке)
         ServerClient.token = Settings.apiToken(this)
 
+        observeChannelStatus()
+        bindToggle()
+        bindProfileControls()
+        bindSettingsButton()
+        clearButtonTints()
+
+        ensureModelInstalled()
+        updateToggle()
+        requestPermissionsIfNeeded()
+    }
+
+    // ------------------------------------------------------------------
+    // Слушатели / регистрация UI (тела -- из onCreate, без изменений)
+    // ------------------------------------------------------------------
+
+    private fun observeChannelStatus() {
         // Статус канала в UI: при живом сервисе показываем переподключение
         // (обрыв сети) и возврат канала (план «гибридный туннель»)
         TunnelClient.setOnStateListener { st ->
@@ -97,7 +114,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
 
+    private fun bindToggle() {
         btnToggle = findViewById(R.id.btnToggle)
         tvToggleHint = findViewById(R.id.tvToggleHint)
         ripples = findViewById(R.id.ripples)
@@ -107,24 +126,27 @@ class MainActivity : AppCompatActivity() {
             // сервис стартует/останавливается асинхронно — перерисовка после гонки
             btnToggle.postDelayed({ updateToggle() }, 400)
         }
+    }
+
+    private fun bindProfileControls() {
         spinnerProfile = findViewById(R.id.spinnerProfile)
         btnProfileApply = findViewById(R.id.btnProfileApply)
         tvProfileNow = findViewById(R.id.tvProfileNow)
         btnProfileApply.setOnClickListener { applySelectedProfile() }
+    }
 
+    private fun bindSettingsButton() {
         // Меню настроек: адрес сервера, DDNS, токен, пин (отдельный экран)
         findViewById<View>(R.id.btnSettings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+    }
 
+    private fun clearButtonTints() {
         // Material-стиль кнопок перекрашивает background заливкой colorPrimary —
         // сбрасываем тинт, чтобы виден остался кастомный градиент/контур
         intArrayOf(R.id.btnToggle, R.id.btnProfileApply)
             .forEach { findViewById<Button>(it).backgroundTintList = null }
-
-        ensureModelInstalled()
-        updateToggle()
-        requestPermissionsIfNeeded()
     }
 
     override fun onResume() {
@@ -140,6 +162,12 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(profileSync)
+    }
+
+    override fun onDestroy() {
+        // синглтон TunnelClient держал слушателя -> утечка Activity (A8)
+        TunnelClient.setOnStateListener(null)
+        super.onDestroy()
     }
 
     /**
@@ -253,10 +281,19 @@ class MainActivity : AppCompatActivity() {
                     n
                 }
                 var done = 0
+                // zip-slip: имя записи берётся из zip как есть — запись с '../'
+                // увела бы распаковку за пределы filesDir. Сравниваем канонические
+                // пути: canonicalPath разворачивает '..' и симлинки
+                val targetDir = filesDir.canonicalPath + File.separator
                 ZipInputStream(assets.open(MODEL_ASSET).buffered()).use { zip ->
                     var entry = zip.nextEntry
                     while (entry != null) {
                         val dest = File(filesDir, entry.name)
+                        if (!dest.canonicalPath.startsWith(targetDir)) {
+                            throw IOException(
+                                "zip-slip: entry '${entry.name}' вне filesDir"
+                            )
+                        }
                         if (entry.isDirectory) {
                             dest.mkdirs()
                         } else {
@@ -576,8 +613,9 @@ class MainActivity : AppCompatActivity() {
     private fun stopAssistant() {
         stopService(Intent(this, AssistantService::class.java))
         // Канал закрывается и в onDestroy сервиса; здесь -- сразу, чтобы
-        // соединение не висело до завершения сервиса
-        TunnelClient.close()
+        // соединение не висело до завершения сервиса. В фоне: close()
+        // @Synchronized и может ждать мьютекс start() до 3 с на main (A8)
+        thread { TunnelClient.close() }
         setStatus("Сервис остановлен.")
     }
 }

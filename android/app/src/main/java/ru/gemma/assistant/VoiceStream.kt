@@ -9,6 +9,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 
@@ -105,8 +106,10 @@ class VoiceStream(
                 override fun onClosed() {
                     Log.i(TAG, "tunnel stream closed")
                     ended = true
-                    // reply мог дойти до обрыва -- не теряем его
-                    flushReply()
+                    // reply мог дойти до обрыва -- не теряем его;
+                    // без reply и без ошибки (чистое закрытие) иначе
+                    // состояние залипает в SPEAKING
+                    if (!flushReply()) onEvent(Event.Failed)
                 }
             })
             if (voiceHandle == null) {
@@ -114,10 +117,18 @@ class VoiceStream(
                 ended = true
             }
         } else {
-            val wsUrl = server.trimEnd('/')
+            // Прямой LAN/URL-путь: сервер (voice_ws, чек A1 с 5a1f481)
+            // принимает WS только с ?token= -- как и туннельный сабстрим
+            // (там token дописывает tunnel.py). Без параметра -- 403
+            // «bad token» и молчаливый фолбэк на телефоне.
+            val base = server.trimEnd('/')
                 .replaceFirst("http://", "ws://")
                 .replaceFirst("https://", "wss://") + "/ws_voice"
-            Log.i(TAG, "connect $wsUrl")
+            val tok = ServerClient.token.trim()
+            val wsUrl = if (tok.isEmpty()) base
+            else base + "?token=" + URLEncoder.encode(tok, "UTF-8")
+            // URL в лог НЕ в полном виде: с токеном он утекает в logcat.
+            Log.i(TAG, "connect $base${if (tok.isEmpty()) "" else " (auth)"}")
             val c = OkHttpClient.Builder()
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)   // long-poll живёт вечно
@@ -152,7 +163,9 @@ class VoiceStream(
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         Log.i(TAG, "closed $code $reason")
                         ended = true
-                        flushReply()
+                        // чистое закрытие без reply: эмитим Failed,
+                        // иначе SPEAKING залипнет навсегда (A2)
+                        if (!flushReply()) onEvent(Event.Failed)
                     }
                 },
             )

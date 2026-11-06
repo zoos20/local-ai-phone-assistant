@@ -2,7 +2,7 @@
 """kokoro-ru sidecar: HTTP-сервис озвучки в отдельном окружении (.venv-tts).
 
 Запуск (см. start-kokoro.ps1):
-    <project>/.venv-tts\\Scripts\\python.exe tts_kokoro_server.py
+    <project>\server\.venv-tts\\Scripts\\python.exe tts_kokoro_server.py
 
 Модель (torch CPU, 82M, голос dima по умолчанию) грузится один раз при
 старте и живёт в процессе; server.py шлёт сюда нормализованный текст и
@@ -17,8 +17,8 @@ from __future__ import annotations
 import io
 import json
 import logging
-import pathlib
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,18 +31,6 @@ os.environ.setdefault("TORCH_HOME", str(Path(__file__).resolve().parent / ".cach
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS = BASE_DIR / "models" / "kokoro_ru"
-
-# ru_g2p.py читает kokoro-config.json без encoding= (падает на cp1251) --
-# включаем utf-8 по умолчанию для Path.read_text.
-_orig_read_text = pathlib.Path.read_text
-
-
-def _utf8_read_text(self, *args, **kwargs):
-    kwargs.setdefault("encoding", "utf-8")
-    return _orig_read_text(self, *args, **kwargs)
-
-
-pathlib.Path.read_text = _utf8_read_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,16 +85,50 @@ def _ensure_voice(voice: str):
         log.info("чекпоинт '%s' готов", ckpt)
     if voice not in _packs:
         _packs[voice] = torch.load(str(MODELS / "voices" / pack_name),
-                                   map_location="cpu", weights_only=False)
+                                   map_location="cpu", weights_only=True)
     _voice = voice
     return _models[ckpt], _packs[voice]
+
+
+def _vocab_config_copy() -> Path:
+    """ASCII-копия kokoro-config.json для RuG2P (владелец -- вызывающий).
+
+    ru_g2p.RuG2P читает конфиг через Path.read_text() без encoding=, а на
+    Windows это cp1251 -> UnicodeDecodeError (в файле не-ASCII байты).
+    json.dumps(ensure_ascii=True) экранирует не-ASCII в \\uXXXX: копия
+    становится чистым ASCII (cp1251 читает без ошибок), а json.loads
+    восстанавливает исходные символы -- семантика конфига не меняется.
+    """
+    cfg = json.loads((MODELS / "kokoro-config.json").read_text(encoding="utf-8"))
+    fd, tmp = tempfile.mkstemp(prefix="kokoro-config-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            json.dump(cfg, fh, ensure_ascii=True)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return Path(tmp)
+
+
+def _make_g2p() -> RuG2P:
+    """Конструирует RuG2P без глобального патча pathlib.
+
+    Раньше Path.read_text подменялся на весь процесс (ради чтения конфига
+    выше); теперь utf-8 применяется только к этой копии, остальной код
+    читает файлы обычным способом.
+    """
+    copy = _vocab_config_copy()
+    try:
+        return RuG2P(vocab_path=copy)
+    finally:
+        copy.unlink(missing_ok=True)
 
 
 def load(voice: str) -> None:
     """Грузит G2P + дефолтный голос (вызывается до старта сервера)."""
     global _g2p
     log.info("загрузка G2P (RUAccent)...")
-    _g2p = RuG2P()
+    _g2p = _make_g2p()
     with _lock:
         _ensure_voice(voice)
     log.info("модель '%s' готова", voice)

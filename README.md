@@ -61,8 +61,9 @@
 ```
 android/                клиент-приложение (Kotlin, foreground service)
   app/src/main/assets/  голосовая модель Vosk (zip + лицензия Apache 2.0)
+  app/src/test/         юнит-тесты (распознавание, фонетика, RMS, wake...)
 scripts/                скрипты запуска/настройки (PowerShell):
-  start-all.ps1           автозапуск стека (llama-server + server.py + tunnel.py)
+  start-all.ps1           автозапуск стека (llama-server + server.py + kokoro + tunnel)
   stop-all.ps1            остановка всего стека (8080/8090/8091/8443, есть -WhatIf)
   start-kokoro.ps1        запуск TTS-sidecar
   setup-firewall.ps1      разовый: правила фаервола 8090 (LAN) и 8443 (туннель) (админ)
@@ -72,17 +73,35 @@ scripts/                скрипты запуска/настройки (PowerS
   setup-ddns-task.ps1     разовый: регистрация задачи планировщика Gemma-DDNS
   gen-cert.py             самоподписанный сертификат туннеля (создаёт tunnel.py сам)
 server/                 Python-часть (здесь же .env, окружения, models/):
-  server.py               FastAPI: /ask /voice /ws_voice /tts /confirm /profile /health /cert
+  server.py               FastAPI: точка входа, /ask /voice /ws_voice /tts /confirm...
   tunnel.py               туннель: wss://:8443/tunnel -> прокси на 8090 (доступ из интернета)
-  llm.py                  промпт, профили (характер ↔ голос ↔ пол), стриминг
-                          ответа (chat_stream/decide_stream) от llama-server
+  answer.py               ответы: промпт, профили, stream (chat_stream/decide_stream)
+  decide.py               маршрутизация решения (decide/decide_stream, профили)
+  app_state.py            глобальное состояние: история, pending, prefetch, профиль
+  dispatch.py             ветвление команд: текст/голос/подтверждение
+  voice_ws.py             WS-стриминг аудио /ws_voice (endpointing, сегменты)
+  profile_detect.py       распознавание команды смены профиля (+ fuzzy)
+  api_models.py           pydantic-модели запросов/ответов
+  dialog_state.py         конечный автомат диалога сервера
+  search.py               веб-поиск (для инструмента)
+  speech_text.py          нормализация текста для озвучки
+  llm/                    пакет LLM-клиента:
+    client.py               HTTP-клиент llama-server (chat/chat_stream)
+    decide.py               решение-логика + напоминание схемы
+    fast_reply.py           быстрые реплики
+    profiles.py             профили (характер ↔ голос ↔ пол)
+    stream_parser.py        парсер SSE-стрима
+    _time.py                ретраи/таймауты
   stt.py                  распознавание речи (faster-whisper, CPU, int8)
   tts.py                  озвучка: kokoro-ru через sidecar, фолбэк Piper
   tts_kokoro_server.py    sidecar kokoro-ru на 8091 (отдельное окружение .venv-tts)
   tools.py                действия: поиск, Telegram, VK, звонки
   config.py               настройки из .env (префикс ASSISTANT_)
   login_tg.py             разовый вход в Telegram (Telethon user session)
+  tests/                  pytest: 111 тестов (endpointing, decide, профили...)
+  pyproject.toml          ruff + pytest-конфигурация
   requirements.txt        зависимости основного окружения
+  requirements-dev.txt    dev-зависимости (pytest, ruff)
   .env.example            шаблон настроек
 models/                 голоса Piper (*.onnx) внутри server/ — не в репозитории
 ```
@@ -90,6 +109,20 @@ models/                 голоса Piper (*.onnx) внутри server/ — н�
 Python-модули лежат плоско внутри `server/` (плоские импорты `import llm`
 и пути `Path(__file__).parent` для `.env`/моделей/данных), поэтому
 `.env`, окружения `.venv`/`.venv-tts` и каталог `models/` создаются там же.
+Пакет `llm/` — единственное вложенное исключение (импорт `import llm`
+подхватывает пакет).
+
+### Тесты
+
+```powershell
+# Python (в server/, нужен dev-окружение: pip install -r requirements-dev.txt)
+.venv\Scripts\python.exe -m pytest -q      # 111 тестов
+.venv\Scripts\python.exe -m ruff check .   # линтер
+
+# Android (в android/)
+.\gradlew.bat testDebugUnitTest            # 77 юнит-тестов
+.\gradlew.bat assembleDebug
+```
 
 ## Требования
 

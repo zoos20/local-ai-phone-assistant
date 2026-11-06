@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import httpx
+import vk_api
 
 from config import settings
 
@@ -88,12 +89,20 @@ async def tg_send(to: str, message: str) -> str:
     global _tg_client
     if _tg_client is None:
         # Сессия -- файл .session рядом с указанным путём; при первом запуске
-        # потребуется вход (см. login_tg.py).
-        _tg_client = TelegramClient(settings.tg_session, settings.tg_api_id,
-                                    settings.tg_api_hash)
-        await _tg_client.connect()
-        if not await _tg_client.is_user_authorized():
-            raise ToolError("Сессия Telegram не авторизована — выполните login_tg.py.")
+        # потребуется вход (см. login_tg.py). Клиент присваиваем глобалу ТОЛЬКО
+        # после успешного connect() -- иначе при сбое остался бы «битый» не-None.
+        client = TelegramClient(settings.tg_session, settings.tg_api_id,
+                                settings.tg_api_hash)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                raise ToolError("Сессия Telegram не авторизована — выполните login_tg.py.")
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolError(f"Telegram недоступен: {exc}") from exc
+        _tg_client = client
 
     target = to.strip()
     try:
@@ -102,10 +111,15 @@ async def tg_send(to: str, message: str) -> str:
         raise ToolError(f"Не нашёл получателя «{to}» в Telegram.") from exc
     except RPCError as exc:
         raise ToolError(f"Telegram ответил ошибкой: {exc}") from exc
+    except Exception as exc:
+        # Сеть/telethon-специфичные сбои -- тоже в человеческий ToolError.
+        raise ToolError(f"Не нашёл получателя «{to}» в Telegram: {exc}") from exc
 
     try:
         await _tg_client.send_message(entity, message)
     except RPCError as exc:
+        raise ToolError(f"Не отправил в Telegram: {exc}") from exc
+    except Exception as exc:
         raise ToolError(f"Не отправил в Telegram: {exc}") from exc
 
     name = getattr(entity, "first_name", None) or to

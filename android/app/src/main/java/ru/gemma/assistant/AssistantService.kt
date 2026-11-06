@@ -1,14 +1,9 @@
 package ru.gemma.assistant
 
 import android.Manifest
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
@@ -24,10 +19,9 @@ import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import android.provider.ContactsContract
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import kotlin.math.sin
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,8 +58,6 @@ class AssistantService : Service() {
         @Volatile var isRunning = false
 
         private const val SAMPLE_RATE = 16000
-        private const val CHANNEL_ID = "gemma_service"
-        private const val NOTIFICATION_ID = 1
         private const val WAKE_PHRASE = "гемма"    // геммы/гемме/гемму...
         // цель фонетического сравнения (буквальный WAKE_PHRASE -- "гемма"
         // с окончанием -- норм; отдельная константа нужна была из-за
@@ -123,6 +115,10 @@ class AssistantService : Service() {
         // нового удара грамматики (удары приходят пачкой и кончаются --
         // раньше команда просто не стартовала: логи 19:58:31/46, 20:05:58)
         private const val VERIFY_RETRY_MS = 1500
+        // A2: дедлайн озвучки в SPEAKING: чистое закрытие WS без reply ->
+        // событие Failed не приходит и состояние залипало бы в SPEAKING
+        // вечно (SPEAK_LOCK удержан, wake word не слушается)
+        private const val SPEAKING_TIMEOUT_MS = 90_000
         // ОКНО verify = только ХВОСТ кольцевого буфера (а не все 7 с).
         //
         // Живой тест 29.10 «не слышит с первого раза»: verify декодировал
@@ -188,30 +184,103 @@ class AssistantService : Service() {
         // сработала как фолбэк «нет» -- защита от обрывков шума в
         // распознавателе (план, фаза 4: прочая речь -> безопасный фолбэк)
         private const val MIN_CONFIRM_SPEECH_MS = 1500
-
-        private val YES_WORDS = setOf(
-            "да", "ага", "угу", "давай", "конечно", "ок", "окей", "поехали",
-            "отправляй", "отправь", "отправить", "да отправь"
-        )
-        private val NO_WORDS = setOf(
-            "нет", "отмена", "отмени", "не надо", "не нужно", "стоп", "отбой",
-            "отменить", "не отправляй"
-        )
-        // Стоп-слова: произносятся во время записи команды (COMMAND) -- сервис
-        // тут же прекращает слушать, сбрасывает запись и уходит в фоновое
-        // ожидание «Гемма», ничего не отправляя. В CONFIRM работают как
-        // отмена (см. classifyAnswer). Одиночные слова -- сравнение идёт по
-        // токенам; составные фразы («хватит уже») не включаем: токенизатор
-        // Vosk может разбить их иначе, чем мы.
-        private val STOP_WORDS = setOf(
-            "стоп", "хватит", "перестань", "остановись", "замолчи",
-            "закройся", "отбой", "отвали"
-        )
     }
 
     private enum class State { WAKE, COMMAND, SPEAKING, CONFIRM, FOLLOWUP, STOPPED }
 
-    @Volatile private var state = State.WAKE
+    /**
+     * Состояние сессии / стейт-машины audioLoop (Фаза 3, ветка 1).
+     *
+     * Раньше оно жило в двух местах: `state` -- @Volatile-поле сервиса
+     * (его пишут сетевые корутины, читает аудио-поток), остальные --
+     * var-замыканиями внутри audioLoop (объявлялись заново при каждом
+     * входе в цикл). Теперь весь рабочий набор автомат -- здесь.
+     *
+     * Доступ: call-site'ы используют `session.<имя>` (поле [session]
+     * ниже) -- имена и начальные значения переменных НЕ менялись.
+     *
+     * Сброс: инициализатор этого класса (значения в точности повторяют
+     * прежние начальные значения var). audioLoop стартует один раз на
+     * экземпляр сервиса (поток создаётся в onStartCommand только при
+     * !running, running сбрасывается в onDestroy) -- поэтому конструктор
+     * SessionState и есть «новая сессия»; путь остановки остался прежним:
+     * onDestroy зовёт transition(…, State.STOPPED).
+     *
+     * Логика сюда НЕ переносилась: ringWrite/ringSnapshot/ringPeakRms/
+     * enterSpeaking остаются локальными функциями audioLoop.
+     */
+    private class SessionState {
+        /** Текущее состояние автомата (прежде -- поле AssistantService). */
+        @Volatile var state: State = State.WAKE
+
+        val commandBuf = ByteArrayOutputStream()
+        var commandStartMs = 0L
+        var lastWakeLogMs = 0L
+        var speechSeen = false
+        var lastSpeechMs = 0L
+        var rmsMax = 0
+        var lastWordsMs = 0L        // Vosk услышал слова команды
+        var speechMsTotal = 0       // суммарно «речевых» мс (энергия)
+        var lastNoiseLogMs = 0L
+        var lastVerifyMs = 0L         // троттлинг verifyWakeWord
+        var verifyRetryDeadlineMs = 0L // окно повторных verify после EMPTY
+        var lastSpeakHearLogMs = 0L   // троттлинг лога слуха в SPEAKING
+        var speakDeadlineMs = 0L      // дедлайн озвучки (A2): 0 -- не идёт
+        var lastPauseRmsLogMs = 0L    // троттлинг лога rms в паузе барж-ина
+        // --- барж-ин (п. 11): полудуплекс во время озвучки --------------
+        // Эхо ответа глушит стоп-слово (доказано логом: speak-hear целиком
+        // содержит текст ответа, «стоп» не выделяется). Поэтому: как только
+        // энергия голоса поднимается над фоном эха -- СТАВИМ озвучку на
+        // паузу, эхо исчезает, и в наступившей тишине Vosk чисто слышит
+        // стоп-слово. Не стоп -> возобновляем озвучку с той же секунды.
+        var echoBase = 0.0            // скользящий уровень фона (эха)
+        var bargeFrames = 0           // кадров подряд сверх порога
+        var bargePaused = false       // озвучка на паузе (барж-ин)
+        var bargePauseMs = 0L
+        var bargeVoiceMs = 0L         // последний «речевой» кадр на паузе
+        var bargeSettleUntil = 0L     // окно settle: триггер выключен
+        var confirmDeadlineMs = 0L
+        var confirmToken: String? = null
+        // --- прямое слушание в подтверждении (фаза 4) -------------------
+        // Сколько «речевых» мс накоплено в окне CONFIRM: фолбэк «прочая
+        // речь -> нет» требует реальной речи, а не обрывков шума.
+        var confirmSpeechMs = 0
+        var lastConfirmHearLogMs = 0L   // троттлинг лога confirm-hear
+        var lastState: State = State.WAKE
+        // --- follow-up (фаза 4): речь в окне дослушивания ---------------
+        // Сколько «речевых» мс подряд накоплено в текущем кадре (сброс
+        // тишиной); FOLLOWUP_TRIG_MS подряд = начало вопроса без «Геммы».
+        var followupSpeechMs = 0
+        // была ли ЛЮБАЯ речь в окне follow-up (шум тоже считается --
+        // чтобы после неё держать окно ещё пару секунд, а не резать)
+        var followupAnySpeech = false
+
+        // кольцевой буфер последних WAKE_RING_MS мс звука: при срабатывании
+        // грамматики прогоняем его через ПОЛНЫЙ распознаватель и требуем
+        // реально услышанное слово «гемму» (похожий фон/шум не должен
+        // проходить -- одних энергии/позиции фразы недостаточно)
+        val ringBuf = ByteArray(WAKE_RING_MS * SAMPLE_RATE * 2 / 1000)
+        var ringPos = 0
+        var ringFilled = 0
+    }
+
+    /** Единственный экземпляр состояния сессии (см. [SessionState]). */
+    private val session = SessionState()
+
+    /**
+     * Единая точка смены состояния стейт-машины ([SessionState.state]):
+     * `from -> to`.
+     *
+     * Побочных эффектов здесь НЕТ (осознанно): логи, сбросы,
+     * updateNotification, cue и guard'ы остаются на call-site вокруг
+     * вызова -- как и до рефакторинга. [from] -- исходное состояние
+     * call-site (для читаемости и отладки); запись `to` выполняется
+     * всегда.
+     */
+    private fun transition(from: State, to: State) {
+        session.state = to
+    }
+
     private lateinit var server: String
 
     private var audioThread: Thread? = null
@@ -348,43 +417,61 @@ class AssistantService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
-        isRunning = false
-        state = State.STOPPED
-        audioThread?.join(2000)
-        audioThread = null
-        // Стоп сервиса == Стоп туннеля (лifecycle канала привязан к сервису,
-        // план «гибридный туннель»): канал закрывается, реконнект прекращается
-        TunnelClient.close()
-        // BT-аудио: снимаем обработчик и возвращаем системное маршрутизирование
         try {
-            audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
-            if (btActive) {
-                if (Build.VERSION.SDK_INT >= 31) {
-                    audioManager?.clearCommunicationDevice()
-                } else {
-                    @Suppress("DEPRECATION")
-                    audioManager?.stopBluetoothSco()
+            running = false
+            isRunning = false
+            transition(session.state, State.STOPPED)
+            val thread = audioThread
+            thread?.join(2000)
+            audioThread = null
+            // Стоп сервиса == Стоп туннеля (лifecycle канала привязан к сервису,
+            // план «гибридный туннель»): канал закрывается, реконнект прекращается
+            // В фоне: close() @Synchronized и может ждать мьютекс start()
+            // (sleep до 3 с) -- на main блокировало бы UI (A8)
+            Thread { TunnelClient.close() }.start()
+            // BT-аудио: снимаем обработчик и возвращаем системное маршрутизирование
+            try {
+                audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+                if (btActive) {
+                    if (Build.VERSION.SDK_INT >= 31) {
+                        audioManager?.clearCommunicationDevice()
+                    } else {
+                        @Suppress("DEPRECATION")
+                        audioManager?.stopBluetoothSco()
+                    }
+                    audioManager?.mode = AudioManager.MODE_NORMAL
+                    btActive = false
                 }
-                audioManager?.mode = AudioManager.MODE_NORMAL
-                btActive = false
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
+            recorder = null
+            // Vosk закрываем ТОЛЬКО после успешного join: закрытие параллельно
+            // с ещё работающим потоком = гонка на нативном слое (UAF-краш).
+            // Поток не успел -> оставляем объекты до смерти процесса
+            // (утечка лучше краша) (A8)
+            val stopped = thread == null || !thread.isAlive
+            if (stopped) {
+                try {
+                    recognizer?.close()
+                    wakeRecognizer?.close()
+                    voskModel?.close()
+                } catch (_: Exception) {
+                }
+                recognizer = null
+                wakeRecognizer = null
+                voskModel = null
+            } else {
+                Log.w(TAG, "audio thread alive after join(2000) -- " +
+                        "Vosk не закрываем (утечка до смерти процесса)")
+            }
+            scope.cancel()
+            super.onDestroy()
+        } finally {
+            // acquire() без таймаута (см. acquireWakeLock): release() обязателен
+            // при любом исходе тела — иначе lock держался бы до смерти процесса
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
         }
-        recorder = null
-        try {
-            recognizer?.close()
-            wakeRecognizer?.close()
-            voskModel?.close()
-        } catch (_: Exception) {
-        }
-        recognizer = null
-        wakeRecognizer = null
-        voskModel = null
-        scope.cancel()
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
-        super.onDestroy()
     }
 
     // ------------------------------------------------------------------
@@ -458,77 +545,28 @@ class AssistantService : Service() {
             Log.w(TAG, "AEC/NS setup failed", t)
         }
 
-        val commandBuf = ByteArrayOutputStream()
-        var commandStartMs = 0L
-        var lastWakeLogMs = 0L
-        var speechSeen = false
-        var lastSpeechMs = 0L
-        var rmsMax = 0
-        var lastWordsMs = 0L        // Vosk услышал слова команды
-        var speechMsTotal = 0       // суммарно «речевых» мс (энергия)
-        var lastNoiseLogMs = 0L
-        var lastVerifyMs = 0L         // троттлинг verifyWakeWord
-        var verifyRetryDeadlineMs = 0L // окно повторных verify после EMPTY
-        var lastSpeakHearLogMs = 0L   // троттлинг лога слуха в SPEAKING
-        var lastPauseRmsLogMs = 0L    // троттлинг лога rms в паузе барж-ина
-        // --- барж-ин (п. 11): полудуплекс во время озвучки --------------
-        // Эхо ответа глушит стоп-слово (доказано логом: speak-hear целиком
-        // содержит текст ответа, «стоп» не выделяется). Поэтому: как только
-        // энергия голоса поднимается над фоном эха -- СТАВИМ озвучку на
-        // паузу, эхо исчезает, и в наступившей тишине Vosk чисто слышит
-        // стоп-слово. Не стоп -> возобновляем озвучку с той же секунды.
-        var echoBase = 0.0            // скользящий уровень фона (эха)
-        var bargeFrames = 0           // кадров подряд сверх порога
-        var bargePaused = false       // озвучка на паузе (барж-ин)
-        var bargePauseMs = 0L
-        var bargeVoiceMs = 0L         // последний «речевой» кадр на паузе
-        var bargeSettleUntil = 0L     // окно settle: триггер выключен
-        var confirmDeadlineMs = 0L
-        var confirmToken: String? = null
-        // --- прямое слушание в подтверждении (фаза 4) -------------------
-        // Сколько «речевых» мс накоплено в окне CONFIRM: фолбэк «прочая
-        // речь -> нет» требует реальной речи, а не обрывков шума.
-        var confirmSpeechMs = 0
-        var lastConfirmHearLogMs = 0L   // троттлинг лога confirm-hear
-        var lastState: State = State.WAKE
-        // --- follow-up (фаза 4): речь в окне дослушивания ---------------
-        // Сколько «речевых» мс подряд накоплено в текущем кадре (сброс
-        // тишиной); FOLLOWUP_TRIG_MS подряд = начало вопроса без «Геммы».
-        var followupSpeechMs = 0
-        // была ли ЛЮБАЯ речь в окне follow-up (шум тоже считается --
-        // чтобы после неё держать окно ещё пару секунд, а не резать)
-        var followupAnySpeech = false
-
         updateNotification("Слушаю «Гемма»…")
         record.startRecording()
         Log.i(TAG, "audio loop started")
 
         val frame = ByteArray(SAMPLE_RATE * 2 / 10) // 100 мс
-
         // кольцевой буфер последних WAKE_RING_MS мс звука: при срабатывании
-        // грамматики прогоняем его через ПОЛНЫЙ распознаватель и требуем
-        // реально услышанное слово «гемму» (похожий фон/шум не должен
-        // проходить -- одних энергии/позиции фразы недостаточно)
-        val ringBuf = ByteArray(WAKE_RING_MS * SAMPLE_RATE * 2 / 1000)
-        var ringPos = 0
-        var ringFilled = 0
-
         fun ringWrite(b: ByteArray, len: Int) {
             var off = 0
             while (off < len) {
-                val chunk = minOf(ringBuf.size - ringPos, len - off)
-                System.arraycopy(b, off, ringBuf, ringPos, chunk)
-                ringPos = (ringPos + chunk) % ringBuf.size
-                if (ringFilled < ringBuf.size) ringFilled += chunk
+                val chunk = minOf(session.ringBuf.size - session.ringPos, len - off)
+                System.arraycopy(b, off, session.ringBuf, session.ringPos, chunk)
+                session.ringPos = (session.ringPos + chunk) % session.ringBuf.size
+                if (session.ringFilled < session.ringBuf.size) session.ringFilled += chunk
                 off += chunk
             }
         }
 
         fun ringSnapshot(): ByteArray {
-            val out = ByteArray(ringFilled)
-            val start = (ringPos - ringFilled + ringBuf.size) % ringBuf.size
-            for (i in 0 until ringFilled) {
-                out[i] = ringBuf[(start + i) % ringBuf.size]
+            val out = ByteArray(session.ringFilled)
+            val start = (session.ringPos - session.ringFilled + session.ringBuf.size) % session.ringBuf.size
+            for (i in 0 until session.ringFilled) {
+                out[i] = session.ringBuf[(start + i) % session.ringBuf.size]
             }
             return out
         }
@@ -562,13 +600,13 @@ class AssistantService : Service() {
         //   viaStream=false -- фолбэк: стрим не поднялся/упал -> прежний
         //                      путь POST готового wav (processCommand).
         fun enterSpeaking(viaStream: Boolean) {
-            state = State.SPEAKING
+            transition(State.COMMAND, State.SPEAKING)
             // сброс барж-ина под новую озвучку
-            echoBase = 0.0; bargeFrames = 0; bargePaused = false
+            session.echoBase = 0.0; session.bargeFrames = 0; session.bargePaused = false
             playbackSeen = false
             updateNotification("Отправляю…")
             playCue(Cue.LISTEN_END)     // план, фаза 3, п. 9
-            val bytes = commandBuf.toByteArray()
+            val bytes = session.commandBuf.toByteArray()
             if (viaStream) {
                 // снапшот wav -- на случай, если стрим упадёт до reply
                 pendingWav = AudioUtil.pcmToWav(bytes, SAMPLE_RATE)
@@ -576,6 +614,608 @@ class AssistantService : Service() {
             } else {
                 scope.launch { processCommand(AudioUtil.pcmToWav(bytes, SAMPLE_RATE)) }
             }
+        }
+
+        // --- слушаем wake word ---------------------------------
+        fun handleWake(frame: ByteArray, n: Int): Boolean {
+            ringWrite(frame, n)
+            val text = feedRecognizer(wakeRecognizer, frame, n) ?: return false
+            // что Vosk реально слышит (для диагностики «не реагирует»)
+            val now = System.currentTimeMillis()
+            if (text.isNotBlank() && now - session.lastWakeLogMs > 700) {
+                session.lastWakeLogMs = now
+                Log.i(TAG, "wake-hear: '$text'")
+            }
+            // уровень фонового шума (калибровка порога SPEECH_RMS)
+            val rms = pcmRms(frame, n)
+            if (now - session.lastNoiseLogMs > 3000) {
+                session.lastNoiseLogMs = now
+                Log.i(TAG, "wake-rms=$rms")
+            }
+            if (isWakeTrigger(text)) {
+                // ступень 2: энергия (отсекает очевидный шум).
+                // Пик меряем по ОКНУ из ring-буфера (2 с), а не по
+                // текущему кадру: удар грамматики запаздывает, кадр
+                // в момент удара тихий (rms 35-54), и НАСТОЯЩИЕ
+                // «Геммы» отсекались как too quiet (11 отказов
+                // против 7 попаданий в логе 13:15-13:26).
+                val winRms = ringPeakRms(2000)
+                if (winRms < WAKE_MIN_RMS) {
+                    Log.i(
+                        TAG, "wake rejected: '$text' " +
+                                "winRms=$winRms cur=$rms (too quiet)"
+                    )
+                    session.verifyRetryDeadlineMs = 0L
+                    try { wakeRecognizer?.reset() } catch (_: Exception) {}
+                    return false
+                }
+            }
+            // ступень 3 -- содержимое: полный распознаватель на
+            // последних WAKE_RING_MS мс должен реально услышать
+            // «гемму». Проверяем и на ударе грамматики, и в окне
+            // ПОВТОРА после EMPTY: удар нередко приходит раньше,
+            // чем слово дописывается в кольцевой буфер (verify
+            // heard ''), а новые удары кончаются -- раньше команда
+            // вовсе не стартовала (логи 28.10 19:58:31/46, 20:05:58)
+            if (session.verifyRetryDeadlineMs != 0L && now >= session.verifyRetryDeadlineMs) {
+                Log.i(TAG, "wake verify retry window over")
+                session.verifyRetryDeadlineMs = 0L
+            }
+            if (isWakeTrigger(text) || session.verifyRetryDeadlineMs != 0L) {
+                // троттлинг: грамматика бьёт пачками по нескольку
+                // ударов в секунду, каждый verify -- дороже кадра
+                if (now - session.lastVerifyMs < VERIFY_MIN_GAP_MS) return false
+                session.lastVerifyMs = now
+                val snapshot = ringSnapshot()
+                // ДВА шага (см. VERIFY_SHORT_TAIL_MS / VERIFY_TAIL_MS):
+                // 1) короткий хвост 1.2 с -- свежая «Гемма» у правого
+                //    края буфера, фон из середины окна не мешает;
+                // 2) при MISMATCH -- полное окно 2.5 с («Гемма» могла
+                //    финализироваться с задержкой и лежать старше).
+                var vBytes = VERIFY_SHORT_TAIL_MS * SAMPLE_RATE * 2 / 1000
+                var vFrom = maxOf(0, snapshot.size - vBytes)
+                var vResult =
+                    verifyWakeWord(
+                        if (vFrom <= 0) snapshot
+                        else snapshot.copyOfRange(vFrom, snapshot.size)
+                    )
+                if (vResult == VerifyResult.MISMATCH) {
+                    Log.i(TAG,
+                        "wake verify short mismatch -- trying full window")
+                    vBytes = VERIFY_TAIL_MS * SAMPLE_RATE * 2 / 1000
+                    vFrom = maxOf(0, snapshot.size - vBytes)
+                    vResult =
+                        verifyWakeWord(
+                            if (vFrom <= 0) snapshot
+                            else snapshot.copyOfRange(vFrom, snapshot.size)
+                        )
+                } else if (vResult == VerifyResult.EMPTY) {
+                    // Смерть по пустому окну (смок 06.11 16:40:44 /
+                    // 16:42:35 / 16:45:33): «Гемма» стареет из короткого
+                    // хвоста (1.2 с), а полное окно (2.5 с) на EMPTY
+                    // раньше НЕ проверялось -- все повторы оставались
+                    // '' до "retry window over" и попытка умирала молча.
+                    // Проверяем полное окно; MISMATCH при пустом коротком
+                    // хвосте НЕ отменяет окно повтора (слово может ещё
+                    // не финализироваться: '' -> retry -> 'гемма').
+                    Log.i(TAG,
+                        "wake verify empty short -- trying full window")
+                    vBytes = VERIFY_TAIL_MS * SAMPLE_RATE * 2 / 1000
+                    vFrom = maxOf(0, snapshot.size - vBytes)
+                    val vFull =
+                        verifyWakeWord(
+                            if (vFrom <= 0) snapshot
+                            else snapshot.copyOfRange(vFrom, snapshot.size)
+                        )
+                    if (vFull == VerifyResult.MATCH) vResult = vFull
+                }
+                when (vResult) {
+                    VerifyResult.MISMATCH -> {
+                        // содержимое есть в ОБОИХ окнах, но это не
+                        // «гемма» -- reject
+                        Log.i(TAG, "wake rejected (verify failed)")
+                        session.verifyRetryDeadlineMs = 0L
+                        try { wakeRecognizer?.reset() } catch (_: Exception) {}
+                        return false
+                    }
+                    VerifyResult.EMPTY -> {
+                        // Живой тест 31.10 «часто начинает слушать,
+                        // когда не зову»: свежий удар + EMPTY раньше
+                        // принимался как weak MATCH БЕЗ проверки -- так
+                        // активировались и случайные звуки (у шума
+                        // свободный Vosk не слышит речи -> EMPTY).
+                        // НО и настоящая «Гемма» на первом verify нередко
+                        // EMPTY: удар грамматики приходит, пока слово
+                        // ещё дописывается в ring-буфер (хвост 1.2 с
+                        // обрезает последний звук, Vosk не финализирует
+                        // -> heard '').
+                        //
+                        // Теперь ОБА случая идут в окно повтора
+                        // (VERIFY_RETRY_MS): слово успевает дописаться
+                        // в буфер -> следующий verify даёт MATCH и
+                        // активация происходит (с задержкой ~0.5 с);
+                        // шум остаётся EMPTY до конца окна и
+                        // отклоняется молча -- бип и запись не стартуют.
+                        if (session.verifyRetryDeadlineMs == 0L) {
+                            session.verifyRetryDeadlineMs = now + VERIFY_RETRY_MS
+                            Log.i(
+                                TAG, "wake verify empty on fresh hit -- " +
+                                        "retrying within ${VERIFY_RETRY_MS}ms"
+                            )
+                        } else {
+                            Log.i(TAG, "wake verify empty (retry)")
+                        }
+                        return false
+                    }
+                    VerifyResult.MATCH -> { session.verifyRetryDeadlineMs = 0L }
+                }
+                Log.i(TAG, "wake word hit: '$text'")
+                try {
+                    wakeRecognizer?.reset()
+                    recognizer?.reset()
+                } catch (_: Exception) {
+                }
+                session.commandBuf.reset()
+                // новый цикл: сбрасываем возможный залипший флаг
+                // прерывания от прошлой озвучки
+                speechInterrupted = false
+                // явный wake word = новый диалог: цепочка
+                // follow-up (фаза 4) начинается заново
+                followupDepth = 0
+                // начало команды -- последние COMMAND_PRELUDE_MS из
+                // кольцевого буфера (включая текущий кадр: ringWrite
+                // уже прогнал его в этом же витке). Там и «Гемма»,
+                // и первые слова, произнесённые до финализации
+                // грамматики; фраза «Гемма, сколько времени» без
+                // паузы теперь не обрезается спереди.
+                val snap = ringSnapshot()
+                val preludeBytes =
+                    COMMAND_PRELUDE_MS * SAMPLE_RATE * 2 / 1000
+                val from = maxOf(0, snap.size - preludeBytes)
+                session.commandBuf.write(snap, from, snap.size - from)
+                // потоковый канал (фаза 6, п. 1): prelude теми же
+                // байтами уйдёт при ready, дальше -- кадры на лету;
+                // сервер сам слышит конец фразы (1.6 с тишины)
+                // вместо наших локальных QUIET_END_MS=3 с
+                startVoiceStream(snap.copyOfRange(from, snap.size))
+                session.commandStartMs = now
+                session.speechSeen = false
+                session.lastSpeechMs = 0L
+                session.rmsMax = 0
+                session.lastWordsMs = 0L
+                session.speechMsTotal = 0
+                transition(State.WAKE, State.COMMAND)
+                updateNotification("Слушаю команду…")
+                playCue(Cue.LISTEN_START)   // план, фаза 3, п. 8
+            }
+            return true
+        }
+
+        // --- записываем команду: ввод = слова Vosk, конец = тишина ---
+        fun handleCommand(frame: ByteArray, n: Int): Boolean {
+            session.commandBuf.write(frame, 0, n)
+            // потоковый канал: кадр уходит на сервер НА ЛЕТУ (send
+            // -- no-op после endpoint/abort). commandBuf пишется
+            // как раньше -- фолбэк-путь с POST wav всегда готов.
+            voiceStream?.send(frame)
+            val heard = feedRecognizer(recognizer, frame, n)
+            val now = System.currentTimeMillis()
+            val elapsed = now - session.commandStartMs
+            val rms = pcmRms(frame, n)
+            if (rms > session.rmsMax) session.rmsMax = rms
+            if (rms >= SPEECH_RMS) {
+                session.speechSeen = true
+                session.speechMsTotal += 100
+                session.lastSpeechMs = now
+            }
+            // «ввод» = Vosk услышал слова после wake word.
+            // Шум даёт энергию, но не даёт слов -- поэтому в шуме
+            // ассистент НЕ уходит в распознавание на сервер.
+            if (heard != null) {
+                val words = heard.lowercase()
+                    .replace(WAKE_PHRASE, " ")
+                    // искажения wake word не должны попадать
+                    // в текст команды (гамма -- частое искажение)
+                    .replace(Regex("гемм[а-яё]*|гамма[а-яё]*"), " ")
+                    // свой же сигнал начала прослушивания не считаем
+                    // вводом (микрофон может уловить бип)
+                    .replace("бип", " ")
+                    .replace(Regex("[^а-яёa-z ]"), " ")
+                    .split(Regex("\\s+"))
+                    .filter { it.length >= 2 }
+                if (words.isNotEmpty()) session.lastWordsMs = now
+                // стоп-слово во время записи: прекращаем слушать,
+                // сбрасываем запись и уходим в фоновое ожидание
+                // (ничего не отправляем). Проверка -- общий stopWordHit
+                // (тот же результат, что и здесь по `words`: слова wake
+                // word в STOP_WORDS не входят)
+                val stopHit = stopWordHit(heard)
+                if (stopHit != null) {
+                    Log.i(TAG, "stop word: '$stopHit' -- abort command")
+                    // стрим закрываем с abort: сервер молчит
+                    // (end здесь НЕ шлём -- иначе ответит по мусору)
+                    voiceStream?.abort()
+                    try {
+                        recognizer?.reset()
+                        wakeRecognizer?.reset()
+                    } catch (_: Exception) {
+                    }
+                    transition(State.COMMAND, State.WAKE)
+                    updateNotification("Слушаю «Гемма»…")
+                    playCue(Cue.CANCEL)
+                    return false
+                }
+            }
+            // сервер прислал endpoint (тишина 1.6 с после голоса)
+            // -> закрываем запись СРАЗУ, не досчитывая локальные
+            // QUIET_END_MS=3 с: это и есть выигрыш стриминга
+            if (streamEndpoint) {
+                Log.i(TAG, "stream endpoint -- finish command " +
+                        "(elapsed=$elapsed)")
+                enterSpeaking(viaStream = true)
+                return false
+            }
+
+            val hasWords = session.lastWordsMs > 0
+            // речь закончилась: энергия была, теперь тишина >= 2 с
+            val enoughQuiet = session.speechSeen &&
+                    now - session.lastSpeechMs >= QUIET_END_MS &&
+                    elapsed >= MIN_COMMAND_MS
+
+            val decision: String? = when {
+                // защитный потолок -- говорят непрерывно > 20 с
+                elapsed >= MAX_COMMAND_MS -> "cap"
+                // обычный путь: слова есть + после речи тишина
+                hasWords && enoughQuiet -> "quiet"
+                // слова уже начались -- ждём конца речи (не шумим)
+                hasWords -> null
+                // 10 с без слов: если заметная речь была (Vosk
+                // оглох) -- пусть решит whisper; если тишина/шум --
+                // тихо возвращаемся в фоновое слушание
+                elapsed >= NO_INPUT_MS ->
+                    if (session.speechMsTotal >= MIN_SPEECH_MS) "stt" else "no-input"
+                else -> null
+            }
+
+            if (decision == "no-input") {
+                Log.i(
+                    TAG, "no input in ${NO_INPUT_MS}ms " +
+                            "(speech=${session.speechMsTotal}ms) -- back to wake"
+                )
+                voiceStream?.abort()   // отвечать нечем -- молчим
+                try {
+                    recognizer?.reset()
+                    wakeRecognizer?.reset()
+                } catch (_: Exception) {
+                }
+                transition(State.COMMAND, State.WAKE)
+                updateNotification("Слушаю «Гемма»…")
+            } else if (decision != null) {
+                val bytes = session.commandBuf.toByteArray()
+                Log.i(
+                    TAG, "command captured: size=${bytes.size} " +
+                            "elapsed=$elapsed peak=${pcmPeak(bytes)} " +
+                            "rmsMax=${session.rmsMax} speech=${session.speechMsTotal}ms " +
+                            "end=$decision"
+                )
+                // живой стрим -> «end» и ждём reply-событий;
+                // иначе -- прежний путь POST wav (processCommand)
+                val viaStream = voiceStream
+                    ?.let { it.ready && !it.failed } == true
+                enterSpeaking(viaStream)
+            }
+            return true
+        }
+
+        // --- озвучка ответа: слушаем стоп-слово поверх эха (п. 11) ---
+        // Кадры больше не отбрасываются: кормим полный Vosk и ищем
+        // стоп-слово. Эхо ответа распознаётся как текст ответа
+        // (стоп-слов там обычно нет -> ложных срабатываний мало);
+        // тишина/шум слов не дают. Реакция по частичному результату
+        // -- сразу, не дожидаясь конца фразы.
+        fun handleSpeaking(frame: ByteArray, n: Int): Boolean {
+            // A2: дедлайн: reply/чанки не пришли (чистое закрытие
+            // WS без события Failed) -- иначе состояние и SPEAK_LOCK
+            // залипли бы вечно. Путь -- как у Event.Failed.
+            if (session.speakDeadlineMs > 0 &&
+                System.currentTimeMillis() - session.speakDeadlineMs >
+                SPEAKING_TIMEOUT_MS
+            ) {
+                Log.w(TAG, "SPEAKING timeout after " +
+                        "${SPEAKING_TIMEOUT_MS}ms -- abort")
+                session.speakDeadlineMs = 0
+                // гасим очередь чанков: игрок иначе держал бы
+                // SPEAK_LOCK вечно
+                synchronized(chunkLock) {
+                    chunkStreamDone = true
+                    chunkLock.notifyAll()
+                }
+                val wav = pendingWav
+                pendingWav = null   // иначе Failed запустил бы 2-й POST
+                try {
+                    voiceStream?.close()
+                } catch (_: Exception) {
+                }
+                if (streamReply == null && !streamChunkSeen &&
+                    wav != null
+                ) {
+                    Log.w(TAG, "SPEAKING timeout -- " +
+                            "fallback POST /voice")
+                    scope.launch { processCommand(wav) }
+                } else {
+                    speechInterrupted = false
+                    needReset = true
+                    transition(State.SPEAKING, State.WAKE)
+                    updateNotification("Слушаю «Гемма»…")
+                }
+                return false
+            }
+            ringWrite(frame, n)
+            if (!speechInterrupted) {
+                val rms = pcmRms(frame, n)
+                val nowB = System.currentTimeMillis()
+                val inSettle = nowB < session.bargeSettleUntil
+                // Фон эха. Заморожен во время паузы (иначе спадает,
+                // и вернувшееся эхо снова «громче» фона -> мгновенная
+                // повторная пауза = заикание плеера). После
+                // возобновления -- БЫСТРый подъём (0.30), чтобы base
+                // снова сравнялся с эхом, и лишь потом включается
+                // триггер (окно settle). Голос/эхо -- отделить
+                // энергией надёжно нельзя, поэтому прерывание держим
+                // на распознавании (ниже), а паузу -- только как
+                // вспомогательное «притушить эхо».
+                if (!session.bargePaused) {
+                    val up = if (inSettle) 0.30 else 0.02
+                    session.echoBase = if (rms > session.echoBase) {
+                        session.echoBase * (1 - up) + rms * up
+                    } else {
+                        session.echoBase * 0.85 + rms * 0.15
+                    }
+                }
+
+                // Стоп-слово слушаем ВСЕГДА (и в проигрывании, и в
+                // паузе): слово "стоп" (~300мс) целиком заканчивалось
+                // ещё в фазе триггера, где кадры раньше не шли в Vosk.
+                // Эхо распознаётся как текст ответа (стоп-слов нет).
+                val heard = feedRecognizer(recognizer, frame, n)
+                if (heard != null) {
+                    if (heard.isNotBlank() &&
+                        nowB - session.lastSpeakHearLogMs > 800
+                    ) {
+                        session.lastSpeakHearLogMs = nowB
+                        Log.i(TAG, "speak-hear: '$heard'")
+                    }
+                    val words = heard.lowercase()
+                        .replace(Regex("[^а-яёa-z ]"), " ")
+                        .split(Regex("\\s+"))
+                        .filter { it.length >= 2 }
+                    val hit = words.firstOrNull { it in STOP_WORDS }
+                    if (hit != null) {
+                        Log.i(
+                            TAG, "stop word while speaking: " +
+                                    "'$hit' -- interrupt reply"
+                        )
+                        speechInterrupted = true
+                        needReset = true
+                        playCue(Cue.CANCEL)
+                        speakLatch?.countDown()
+                        return false
+                    }
+                }
+
+                if (BARGE_IN_PAUSE && playbackSeen && !session.bargePaused && !inSettle) {
+                    // Пауза при устойчивом подъёме голоса над фоном.
+                    // 3 кадра (300мс), порог строже (base*2.5): слово
+                    // "стоп" уже в распознавателе (кормим всегда).
+                    if (rms > 500 && rms > session.echoBase * 2.5) {
+                        if (++session.bargeFrames >= 3) {
+                            session.bargePaused = true
+                            session.bargePauseMs = nowB
+                            session.bargeVoiceMs = nowB
+                            speakPauseReq = true
+                            session.bargeFrames = 0
+                            // распознаватель НЕ сбрасываем: начало
+                            // стоп-слова должно дожить до тишины
+                            Log.i(
+                                TAG, "barge-in: voice (rms=" +
+                                        "$rms base=${session.echoBase}) -- " +
+                                        "pause playback"
+                            )
+                        }
+                    } else {
+                        session.bargeFrames = 0
+                    }
+                } else if (session.bargePaused) {
+                    // На паузе эхо стихло -- хвост слова (если был
+                    // заглушён) дораспознаётся в тишине. Свежий
+                    // rms лог -- для настройки порогов.
+                    if (nowB - session.lastPauseRmsLogMs > 400) {
+                        session.lastPauseRmsLogMs = nowB
+                        Log.i(TAG, "pause rms=$rms base=${session.echoBase}")
+                    }
+                    // тишина достаточно долго -- возобновляем озвучку
+                    if (nowB - session.bargePauseMs >= 1200) {
+                        session.bargePaused = false
+                        session.bargeFrames = 0
+                        speakResumeReq = true
+                        playbackStartMs = nowB
+                        // окно settle: триггер выключен, пока фон
+                        // (быстро) догоняет уровень вернувшегося эха
+                        session.bargeSettleUntil = nowB + 1200
+                        Log.i(
+                            TAG, "barge-in: silence -- resume " +
+                                    "playback"
+                        )
+                        // сбрасываем распознаватель, чтобы эхо
+                        // возобновлённой озвучки не копилось
+                        try {
+                            recognizer?.reset()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+            return true
+        }
+
+        // --- прямое слушание «да»/«нет» БЕЗ wake word (фаза 4) ---
+        fun handleConfirm(frame: ByteArray, n: Int): Boolean {
+            val res = feedRecognizerEx(recognizer, frame, n)
+            val text = res?.second
+            val isFinal = res?.first == true
+            val now = System.currentTimeMillis()
+            val rms = pcmRms(frame, n)
+            if (rms >= SPEECH_RMS) session.confirmSpeechMs += 100
+            if (!text.isNullOrBlank() && now - session.lastConfirmHearLogMs > 800) {
+                session.lastConfirmHearLogMs = now
+                Log.i(
+                    TAG, "confirm-hear: '$text'" +
+                            (if (isFinal) " (final)" else "") +
+                            " speech=${session.confirmSpeechMs}ms"
+                )
+            }
+            val answer = text?.let { classifyAnswer(it) }
+            // Фолбэк по плану (фаза 4): прочая разборчивая речь,
+            // не похожая на да/нет, -> безопасное «нет» (для поиска
+            // ответ из памяти, для отправки -- отмена). Только
+            // ФИНАЛ Vosk + минимум речевой энергии -- иначе обрывки
+            // шума отменяли бы подтверждение.
+            val otherSpeech = isFinal &&
+                    !text.isNullOrBlank() &&
+                    session.confirmSpeechMs >= MIN_CONFIRM_SPEECH_MS
+            when {
+                answer == true -> {
+                    Log.i(TAG, "confirm: yes ($text)")
+                    playCue(Cue.EXECUTE)   // «принято, выполняю»
+                    transition(State.CONFIRM, State.SPEAKING)
+                    updateNotification("Отправляю сообщение…")
+                    val token = session.confirmToken
+                    scope.launch { doConfirm(token, true) }
+                }
+                answer == false -> {
+                    Log.i(TAG, "confirm: no ($text)")
+                    playCue(Cue.CANCEL)    // «отмена»
+                    transition(State.CONFIRM, State.SPEAKING)
+                    updateNotification("Отменено")
+                    val token = session.confirmToken
+                    scope.launch { doConfirm(token, false) }
+                }
+                otherSpeech -> {
+                    Log.i(TAG, "confirm: other speech -> no ($text)")
+                    playCue(Cue.CANCEL)
+                    transition(State.CONFIRM, State.SPEAKING)
+                    updateNotification("Отменено")
+                    val token = session.confirmToken
+                    scope.launch { doConfirm(token, false) }
+                }
+                now > session.confirmDeadlineMs -> {
+                    Log.i(TAG, "confirm: timeout")
+                    transition(State.CONFIRM, State.WAKE)
+                    updateNotification("Слушаю «Гемма»…")
+                }
+            }
+            // NB: confirmToken -> pendingToken НЕ пишем: эта запись
+            // перетирала свежий токен processCommand устаревшим
+            // (баг «подтверждение уже истекло»). Токен двигается
+            // только в одну сторону: processCommand -> pendingToken
+            // -> confirmToken (на входе в CONFIRM).
+            return true
+        }
+
+        // --- follow-up: дослушивание после ответа (фаза 4) --------
+        // Окно открыл openFollowUp после финального озвученного
+        // ответа. ТРИГГЕР -- не wake word, а речь (энергия >=
+        // SPEECH_RMS подряд FOLLOWUP_TRIG_MS): как только поймали,
+        // записываем вопрос дальше ПОЛНОСТЬЮ по правилам COMMAND
+        // (сюда же попадает stop-слово и «нет ввода» -- см. ветку
+        // no-input, она уводит в State.WAKE).
+        fun handleFollowup(frame: ByteArray, n: Int): Boolean {
+            ringWrite(frame, n)
+            // кормим полный Vosk УЖЕ в окне дослушивания: первые слова
+            // окна иначе существуют только на сервере (prelude) и локально
+            // не проверяются -- см. сброс ниже
+            val heard = feedRecognizer(recognizer, frame, n)
+            val rms = pcmRms(frame, n)
+            val now = System.currentTimeMillis()
+            // стоп-слово в самом окне дослушивания (запись команды ещё
+            // не началась, отвечать нечем) -- та же последовательность,
+            // что в handleCommand: abort -> reset -> transition -> cue
+            val stopHit = stopWordHit(heard)
+            if (stopHit != null) {
+                Log.i(TAG, "stop word: '$stopHit' -- abort follow-up")
+                voiceStream?.abort()
+                try {
+                    recognizer?.reset()
+                    wakeRecognizer?.reset()
+                } catch (_: Exception) {
+                }
+                transition(State.FOLLOWUP, State.WAKE)
+                updateNotification("Слушаю «Гемма»…")
+                playCue(Cue.CANCEL)
+                return false
+            }
+            if (rms >= SPEECH_RMS) {
+                session.followupSpeechMs += 100
+                session.followupAnySpeech = true   // речь уже была в окне
+            } else {
+                session.followupSpeechMs = 0
+            }
+            when {
+                session.followupSpeechMs >= FOLLOWUP_TRIG_MS -> {
+                    // речь в окне: переходим в запись команды без
+                    // wake word -- та же механика, что после «Геммы»
+                    Log.i(TAG, "follow-up: speech (rms=$rms) -- record command (depth $followupDepth)")
+                    session.commandBuf.reset()
+                    speechInterrupted = false
+                    try {
+                        // recognizer НЕ сбрасываем: в нём -- аудио этого же
+                        // окна (см. feedRecognizer выше). Сброс здесь терял
+                        // стоп-слово, сказанное ДО срабатывания триггера
+                        // энергии: оно уходило на сервер только как prelude
+                        // -> распознавалось там -> шло в LLM как обычная
+                        // команда (баг «стоп после ответа не работает»)
+                        wakeRecognizer?.reset()
+                    } catch (_: Exception) {
+                    }
+                    // первые слова сказаны ДО детекта энергии -- берём
+                    // хвост ring-буфера (как prelude после «Геммы»)
+                    val snap = ringSnapshot()
+                    val preludeBytes =
+                        COMMAND_PRELUDE_MS * SAMPLE_RATE * 2 / 1000
+                    val from = maxOf(0, snap.size - preludeBytes)
+                    session.commandBuf.write(snap, from, snap.size - from)
+                    startVoiceStream(snap.copyOfRange(from, snap.size))
+                    session.commandStartMs = now
+                    session.speechSeen = true
+                    session.lastSpeechMs = now
+                    session.rmsMax = rms
+                    session.lastWordsMs = 0L
+                    session.speechMsTotal = FOLLOWUP_TRIG_MS
+                    transition(State.FOLLOWUP, State.COMMAND)
+                    updateNotification("Слушаю команду…")
+                    // Живой тест 30.10: после ответа в окне дослушивания
+                    // звучало 2 бипа (FOLLOWUP_WAIT при открытии окна +
+                    // LISTEN_START здесь) -- пользователь просил вместо
+                    // пары один. FOLLOWUP_WAIT остаётся, здесь бипа нет.
+                }
+                // тишина до конца окна (речи не было вовсе) --
+                // обычное фоновое слушание
+                now >= followupDeadlineMs && !session.followupAnySpeech -> {
+                    Log.i(TAG, "follow-up: silence ${FOLLOWUP_START_MS}ms -- back to wake")
+                    followupDepth = 0
+                    transition(State.FOLLOWUP, State.WAKE)
+                    updateNotification("Слушаю «Гемма»…")
+                }
+                // речь была, но не дошла до триггера (шум/обрыв) --
+                // держим окно ещё пару секунд и уходим
+                now >= followupDeadlineMs + 2000 -> {
+                    Log.i(TAG, "follow-up: speech attempt failed -- back to wake")
+                    followupDepth = 0
+                    transition(State.FOLLOWUP, State.WAKE)
+                    updateNotification("Слушаю «Гемма»…")
+                }
+            }
+            return true
         }
 
         while (running) {
@@ -595,11 +1235,11 @@ class AssistantService : Service() {
 
             // переход в состояние ожидания подтверждения -- стартуем
             // окно прямого слушания «да/отмена» БЕЗ wake word (фаза 4)
-            if (state != lastState) {
-                if (state == State.CONFIRM) {
-                    confirmDeadlineMs = System.currentTimeMillis() + CONFIRM_MS
-                    confirmSpeechMs = 0
-                    lastConfirmHearLogMs = 0L
+            if (session.state != session.lastState) {
+                if (session.state == State.CONFIRM) {
+                    session.confirmDeadlineMs = System.currentTimeMillis() + CONFIRM_MS
+                    session.confirmSpeechMs = 0
+                    session.lastConfirmHearLogMs = 0L
                     // Сброс устаревшего токена (баг 28.10: «время ответа
                     // истекло»). confirmToken -- локальная переменная цикла
                     // и переживает doConfirm: старый съеденный токен не
@@ -607,544 +1247,45 @@ class AssistantService : Service() {
                     // «== null» ложно), а запись в pendingToken перетирала
                     // свежий токен. На входе в CONFIRM -- всегда чисто:
                     // processCommand кладёт токен ДО смены состояния.
-                    confirmToken = null
+                    session.confirmToken = null
                     Log.i(TAG, "confirm window: ${CONFIRM_MS} ms (direct, no wake)")
                 }
-                if (state == State.FOLLOWUP) {
+                if (session.state == State.FOLLOWUP) {
                     // вход в окно дослушивания (открыл openFollowUp):
                     // счётчики речи -- начисто
-                    followupSpeechMs = 0
-                    followupAnySpeech = false
+                    session.followupSpeechMs = 0
+                    session.followupAnySpeech = false
                     // ring-буфер очищаем: в нём хвост ТОЛЬКО ЧТО
                     // озвученного ответа (эхо), prelude из него унёс бы
                     // слова Геммы в whisper как «речь пользователя»
-                    ringPos = 0
-                    ringFilled = 0
+                    session.ringPos = 0
+                    session.ringFilled = 0
                 }
-                lastState = state
+                if (session.state == State.SPEAKING && session.lastState != State.SPEAKING) {
+                    // вход в озвучку: ставим дедлайн (A2) -- при обрыве
+                    // без reply выведем из SPEAKING сами
+                    session.speakDeadlineMs = System.currentTimeMillis()
+                }
+                session.lastState = session.state
             }
 
-            when (state) {
+            when (session.state) {
                 State.STOPPED -> break
 
-                // --- слушаем wake word ---------------------------------
-                State.WAKE -> {
-                    ringWrite(frame, n)
-                    val text = feedRecognizer(wakeRecognizer, frame, n) ?: continue
-                    // что Vosk реально слышит (для диагностики «не реагирует»)
-                    val now = System.currentTimeMillis()
-                    if (text.isNotBlank() && now - lastWakeLogMs > 700) {
-                        lastWakeLogMs = now
-                        Log.i(TAG, "wake-hear: '$text'")
-                    }
-                    // уровень фонового шума (калибровка порога SPEECH_RMS)
-                    val rms = pcmRms(frame, n)
-                    if (now - lastNoiseLogMs > 3000) {
-                        lastNoiseLogMs = now
-                        Log.i(TAG, "wake-rms=$rms")
-                    }
-                    if (isWakeTrigger(text)) {
-                        // ступень 2: энергия (отсекает очевидный шум).
-                        // Пик меряем по ОКНУ из ring-буфера (2 с), а не по
-                        // текущему кадру: удар грамматики запаздывает, кадр
-                        // в момент удара тихий (rms 35-54), и НАСТОЯЩИЕ
-                        // «Геммы» отсекались как too quiet (11 отказов
-                        // против 7 попаданий в логе 13:15-13:26).
-                        val winRms = ringPeakRms(2000)
-                        if (winRms < WAKE_MIN_RMS) {
-                            Log.i(
-                                TAG, "wake rejected: '$text' " +
-                                        "winRms=$winRms cur=$rms (too quiet)"
-                            )
-                            verifyRetryDeadlineMs = 0L
-                            try { wakeRecognizer?.reset() } catch (_: Exception) {}
-                            continue
-                        }
-                    }
-                    // ступень 3 -- содержимое: полный распознаватель на
-                    // последних WAKE_RING_MS мс должен реально услышать
-                    // «гемму». Проверяем и на ударе грамматики, и в окне
-                    // ПОВТОРА после EMPTY: удар нередко приходит раньше,
-                    // чем слово дописывается в кольцевой буфер (verify
-                    // heard ''), а новые удары кончаются -- раньше команда
-                    // вовсе не стартовала (логи 28.10 19:58:31/46, 20:05:58)
-                    if (verifyRetryDeadlineMs != 0L && now >= verifyRetryDeadlineMs) {
-                        Log.i(TAG, "wake verify retry window over")
-                        verifyRetryDeadlineMs = 0L
-                    }
-                    if (isWakeTrigger(text) || verifyRetryDeadlineMs != 0L) {
-                        // троттлинг: грамматика бьёт пачками по нескольку
-                        // ударов в секунду, каждый verify -- дороже кадра
-                        if (now - lastVerifyMs < VERIFY_MIN_GAP_MS) continue
-                        lastVerifyMs = now
-                        val snapshot = ringSnapshot()
-                        // ДВА шага (см. VERIFY_SHORT_TAIL_MS / VERIFY_TAIL_MS):
-                        // 1) короткий хвост 1.2 с -- свежая «Гемма» у правого
-                        //    края буфера, фон из середины окна не мешает;
-                        // 2) при MISMATCH -- полное окно 2.5 с («Гемма» могла
-                        //    финализироваться с задержкой и лежать старше).
-                        var vBytes = VERIFY_SHORT_TAIL_MS * SAMPLE_RATE * 2 / 1000
-                        var vFrom = maxOf(0, snapshot.size - vBytes)
-                        var vResult =
-                            verifyWakeWord(
-                                if (vFrom <= 0) snapshot
-                                else snapshot.copyOfRange(vFrom, snapshot.size)
-                            )
-                        if (vResult == VerifyResult.MISMATCH) {
-                            Log.i(TAG,
-                                "wake verify short mismatch -- trying full window")
-                            vBytes = VERIFY_TAIL_MS * SAMPLE_RATE * 2 / 1000
-                            vFrom = maxOf(0, snapshot.size - vBytes)
-                            vResult =
-                                verifyWakeWord(
-                                    if (vFrom <= 0) snapshot
-                                    else snapshot.copyOfRange(vFrom, snapshot.size)
-                                )
-                        }
-                        when (vResult) {
-                            VerifyResult.MISMATCH -> {
-                                // содержимое есть в ОБОИХ окнах, но это не
-                                // «гемма» -- reject
-                                Log.i(TAG, "wake rejected (verify failed)")
-                                verifyRetryDeadlineMs = 0L
-                                try { wakeRecognizer?.reset() } catch (_: Exception) {}
-                                continue
-                            }
-                            VerifyResult.EMPTY -> {
-                                // Живой тест 31.10 «часто начинает слушать,
-                                // когда не зову»: свежий удар + EMPTY раньше
-                                // принимался как weak MATCH БЕЗ проверки -- так
-                                // активировались и случайные звуки (у шума
-                                // свободный Vosk не слышит речи -> EMPTY).
-                                // НО и настоящая «Гемма» на первом verify нередко
-                                // EMPTY: удар грамматики приходит, пока слово
-                                // ещё дописывается в ring-буфер (хвост 1.2 с
-                                // обрезает последний звук, Vosk не финализирует
-                                // -> heard '').
-                                //
-                                // Теперь ОБА случая идут в окно повтора
-                                // (VERIFY_RETRY_MS): слово успевает дописаться
-                                // в буфер -> следующий verify даёт MATCH и
-                                // активация происходит (с задержкой ~0.5 с);
-                                // шум остаётся EMPTY до конца окна и
-                                // отклоняется молча -- бип и запись не стартуют.
-                                if (verifyRetryDeadlineMs == 0L) {
-                                    verifyRetryDeadlineMs = now + VERIFY_RETRY_MS
-                                    Log.i(
-                                        TAG, "wake verify empty on fresh hit -- " +
-                                                "retrying within ${VERIFY_RETRY_MS}ms"
-                                    )
-                                } else {
-                                    Log.i(TAG, "wake verify empty (retry)")
-                                }
-                                continue
-                            }
-                            VerifyResult.MATCH -> { verifyRetryDeadlineMs = 0L }
-                        }
-                        Log.i(TAG, "wake word hit: '$text'")
-                        try {
-                            wakeRecognizer?.reset()
-                            recognizer?.reset()
-                        } catch (_: Exception) {
-                        }
-                        commandBuf.reset()
-                        // новый цикл: сбрасываем возможный залипший флаг
-                        // прерывания от прошлой озвучки
-                        speechInterrupted = false
-                        // явный wake word = новый диалог: цепочка
-                        // follow-up (фаза 4) начинается заново
-                        followupDepth = 0
-                        // начало команды -- последние COMMAND_PRELUDE_MS из
-                        // кольцевого буфера (включая текущий кадр: ringWrite
-                        // уже прогнал его в этом же витке). Там и «Гемма»,
-                        // и первые слова, произнесённые до финализации
-                        // грамматики; фраза «Гемма, сколько времени» без
-                        // паузы теперь не обрезается спереди.
-                        val snap = ringSnapshot()
-                        val preludeBytes =
-                            COMMAND_PRELUDE_MS * SAMPLE_RATE * 2 / 1000
-                        val from = maxOf(0, snap.size - preludeBytes)
-                        commandBuf.write(snap, from, snap.size - from)
-                        // потоковый канал (фаза 6, п. 1): prelude теми же
-                        // байтами уйдёт при ready, дальше -- кадры на лету;
-                        // сервер сам слышит конец фразы (1.6 с тишины)
-                        // вместо наших локальных QUIET_END_MS=3 с
-                        startVoiceStream(snap.copyOfRange(from, snap.size))
-                        commandStartMs = now
-                        speechSeen = false
-                        lastSpeechMs = 0L
-                        rmsMax = 0
-                        lastWordsMs = 0L
-                        speechMsTotal = 0
-                        state = State.COMMAND
-                        updateNotification("Слушаю команду…")
-                        playCue(Cue.LISTEN_START)   // план, фаза 3, п. 8
-                    }
-                }
+                State.WAKE -> if (!handleWake(frame, n)) continue
 
-                // --- записываем команду: ввод = слова Vosk, конец = тишина ---
-                State.COMMAND -> {
-                    commandBuf.write(frame, 0, n)
-                    // потоковый канал: кадр уходит на сервер НА ЛЕТУ (send
-                    // -- no-op после endpoint/abort). commandBuf пишется
-                    // как раньше -- фолбэк-путь с POST wav всегда готов.
-                    voiceStream?.send(frame)
-                    val heard = feedRecognizer(recognizer, frame, n)
-                    val now = System.currentTimeMillis()
-                    val elapsed = now - commandStartMs
-                    val rms = pcmRms(frame, n)
-                    if (rms > rmsMax) rmsMax = rms
-                    if (rms >= SPEECH_RMS) {
-                        speechSeen = true
-                        speechMsTotal += 100
-                        lastSpeechMs = now
-                    }
-                    // «ввод» = Vosk услышал слова после wake word.
-                    // Шум даёт энергию, но не даёт слов -- поэтому в шуме
-                    // ассистент НЕ уходит в распознавание на сервер.
-                    if (heard != null) {
-                        val words = heard.lowercase()
-                            .replace(WAKE_PHRASE, " ")
-                            // искажения wake word не должны попадать
-                            // в текст команды (гамма -- частое искажение)
-                            .replace(Regex("гемм[а-яё]*|гамма[а-яё]*"), " ")
-                            // свой же сигнал начала прослушивания не считаем
-                            // вводом (микрофон может уловить бип)
-                            .replace("бип", " ")
-                            .replace(Regex("[^а-яёa-z ]"), " ")
-                            .split(Regex("\\s+"))
-                            .filter { it.length >= 2 }
-                        if (words.isNotEmpty()) lastWordsMs = now
-                        // стоп-слово во время записи: прекращаем слушать,
-                        // сбрасываем запись и уходим в фоновое ожидание
-                        // (ничего не отправляем)
-                        val stopHit = words.firstOrNull { it in STOP_WORDS }
-                        if (stopHit != null) {
-                            Log.i(TAG, "stop word: '$stopHit' -- abort command")
-                            // стрим закрываем с abort: сервер молчит
-                            // (end здесь НЕ шлём -- иначе ответит по мусору)
-                            voiceStream?.abort()
-                            try {
-                                recognizer?.reset()
-                                wakeRecognizer?.reset()
-                            } catch (_: Exception) {
-                            }
-                            state = State.WAKE
-                            updateNotification("Слушаю «Гемма»…")
-                            playCue(Cue.CANCEL)
-                            continue
-                        }
-                    }
-                    // сервер прислал endpoint (тишина 1.6 с после голоса)
-                    // -> закрываем запись СРАЗУ, не досчитывая локальные
-                    // QUIET_END_MS=3 с: это и есть выигрыш стриминга
-                    if (streamEndpoint) {
-                        Log.i(TAG, "stream endpoint -- finish command " +
-                                "(elapsed=$elapsed)")
-                        enterSpeaking(viaStream = true)
-                        continue
-                    }
+                State.COMMAND -> if (!handleCommand(frame, n)) continue
 
-                    val hasWords = lastWordsMs > 0
-                    // речь закончилась: энергия была, теперь тишина >= 2 с
-                    val enoughQuiet = speechSeen &&
-                            now - lastSpeechMs >= QUIET_END_MS &&
-                            elapsed >= MIN_COMMAND_MS
+                State.SPEAKING -> if (!handleSpeaking(frame, n)) continue
 
-                    val decision: String? = when {
-                        // защитный потолок -- говорят непрерывно > 20 с
-                        elapsed >= MAX_COMMAND_MS -> "cap"
-                        // обычный путь: слова есть + после речи тишина
-                        hasWords && enoughQuiet -> "quiet"
-                        // слова уже начались -- ждём конца речи (не шумим)
-                        hasWords -> null
-                        // 10 с без слов: если заметная речь была (Vosk
-                        // оглох) -- пусть решит whisper; если тишина/шум --
-                        // тихо возвращаемся в фоновое слушание
-                        elapsed >= NO_INPUT_MS ->
-                            if (speechMsTotal >= MIN_SPEECH_MS) "stt" else "no-input"
-                        else -> null
-                    }
+                State.CONFIRM -> if (!handleConfirm(frame, n)) continue
 
-                    if (decision == "no-input") {
-                        Log.i(
-                            TAG, "no input in ${NO_INPUT_MS}ms " +
-                                    "(speech=${speechMsTotal}ms) -- back to wake"
-                        )
-                        voiceStream?.abort()   // отвечать нечем -- молчим
-                        try {
-                            recognizer?.reset()
-                            wakeRecognizer?.reset()
-                        } catch (_: Exception) {
-                        }
-                        state = State.WAKE
-                        updateNotification("Слушаю «Гемма»…")
-                    } else if (decision != null) {
-                        val bytes = commandBuf.toByteArray()
-                        Log.i(
-                            TAG, "command captured: size=${bytes.size} " +
-                                    "elapsed=$elapsed peak=${pcmPeak(bytes)} " +
-                                    "rmsMax=$rmsMax speech=${speechMsTotal}ms " +
-                                    "end=$decision"
-                        )
-                        // живой стрим -> «end» и ждём reply-событий;
-                        // иначе -- прежний путь POST wav (processCommand)
-                        val viaStream = voiceStream
-                            ?.let { it.ready && !it.failed } == true
-                        enterSpeaking(viaStream)
-                    }
-                }
-
-                // --- озвучка ответа: слушаем стоп-слово поверх эха (п. 11) ---
-                // Кадры больше не отбрасываются: кормим полный Vosk и ищем
-                // стоп-слово. Эхо ответа распознаётся как текст ответа
-                // (стоп-слов там обычно нет -> ложных срабатываний мало);
-                // тишина/шум слов не дают. Реакция по частичному результату
-                // -- сразу, не дожидаясь конца фразы.
-                State.SPEAKING -> {
-                    ringWrite(frame, n)
-                    if (!speechInterrupted) {
-                        val rms = pcmRms(frame, n)
-                        val nowB = System.currentTimeMillis()
-                        val inSettle = nowB < bargeSettleUntil
-                        // Фон эха. Заморожен во время паузы (иначе спадает,
-                        // и вернувшееся эхо снова «громче» фона -> мгновенная
-                        // повторная пауза = заикание плеера). После
-                        // возобновления -- БЫСТРый подъём (0.30), чтобы base
-                        // снова сравнялся с эхом, и лишь потом включается
-                        // триггер (окно settle). Голос/эхо -- отделить
-                        // энергией надёжно нельзя, поэтому прерывание держим
-                        // на распознавании (ниже), а паузу -- только как
-                        // вспомогательное «притушить эхо».
-                        if (!bargePaused) {
-                            val up = if (inSettle) 0.30 else 0.02
-                            echoBase = if (rms > echoBase) {
-                                echoBase * (1 - up) + rms * up
-                            } else {
-                                echoBase * 0.85 + rms * 0.15
-                            }
-                        }
-
-                        // Стоп-слово слушаем ВСЕГДА (и в проигрывании, и в
-                        // паузе): слово "стоп" (~300мс) целиком заканчивалось
-                        // ещё в фазе триггера, где кадры раньше не шли в Vosk.
-                        // Эхо распознаётся как текст ответа (стоп-слов нет).
-                        val heard = feedRecognizer(recognizer, frame, n)
-                        if (heard != null) {
-                            if (heard.isNotBlank() &&
-                                nowB - lastSpeakHearLogMs > 800
-                            ) {
-                                lastSpeakHearLogMs = nowB
-                                Log.i(TAG, "speak-hear: '$heard'")
-                            }
-                            val words = heard.lowercase()
-                                .replace(Regex("[^а-яёa-z ]"), " ")
-                                .split(Regex("\\s+"))
-                                .filter { it.length >= 2 }
-                            val hit = words.firstOrNull { it in STOP_WORDS }
-                            if (hit != null) {
-                                Log.i(
-                                    TAG, "stop word while speaking: " +
-                                            "'$hit' -- interrupt reply"
-                                )
-                                speechInterrupted = true
-                                needReset = true
-                                playCue(Cue.CANCEL)
-                                speakLatch?.countDown()
-                                continue
-                            }
-                        }
-
-                        if (BARGE_IN_PAUSE && playbackSeen && !bargePaused && !inSettle) {
-                            // Пауза при устойчивом подъёме голоса над фоном.
-                            // 3 кадра (300мс), порог строже (base*2.5): слово
-                            // "стоп" уже в распознавателе (кормим всегда).
-                            if (rms > 500 && rms > echoBase * 2.5) {
-                                if (++bargeFrames >= 3) {
-                                    bargePaused = true
-                                    bargePauseMs = nowB
-                                    bargeVoiceMs = nowB
-                                    speakPauseReq = true
-                                    bargeFrames = 0
-                                    // распознаватель НЕ сбрасываем: начало
-                                    // стоп-слова должно дожить до тишины
-                                    Log.i(
-                                        TAG, "barge-in: voice (rms=" +
-                                                "$rms base=$echoBase) -- " +
-                                                "pause playback"
-                                    )
-                                }
-                            } else {
-                                bargeFrames = 0
-                            }
-                        } else if (bargePaused) {
-                            // На паузе эхо стихло -- хвост слова (если был
-                            // заглушён) дораспознаётся в тишине. Свежий
-                            // rms лог -- для настройки порогов.
-                            if (nowB - lastPauseRmsLogMs > 400) {
-                                lastPauseRmsLogMs = nowB
-                                Log.i(TAG, "pause rms=$rms base=$echoBase")
-                            }
-                            // тишина достаточно долго -- возобновляем озвучку
-                            if (nowB - bargePauseMs >= 1200) {
-                                bargePaused = false
-                                bargeFrames = 0
-                                speakResumeReq = true
-                                playbackStartMs = nowB
-                                // окно settle: триггер выключен, пока фон
-                                // (быстро) догоняет уровень вернувшегося эха
-                                bargeSettleUntil = nowB + 1200
-                                Log.i(
-                                    TAG, "barge-in: silence -- resume " +
-                                            "playback"
-                                )
-                                // сбрасываем распознаватель, чтобы эхо
-                                // возобновлённой озвучки не копилось
-                                try {
-                                    recognizer?.reset()
-                                } catch (_: Exception) {
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // --- прямое слушание «да»/«нет» БЕЗ wake word (фаза 4) ---
-                State.CONFIRM -> {
-                    val res = feedRecognizerEx(recognizer, frame, n)
-                    val text = res?.second
-                    val isFinal = res?.first == true
-                    val now = System.currentTimeMillis()
-                    val rms = pcmRms(frame, n)
-                    if (rms >= SPEECH_RMS) confirmSpeechMs += 100
-                    if (!text.isNullOrBlank() && now - lastConfirmHearLogMs > 800) {
-                        lastConfirmHearLogMs = now
-                        Log.i(
-                            TAG, "confirm-hear: '$text'" +
-                                    (if (isFinal) " (final)" else "") +
-                                    " speech=${confirmSpeechMs}ms"
-                        )
-                    }
-                    val answer = text?.let { classifyAnswer(it) }
-                    // Фолбэк по плану (фаза 4): прочая разборчивая речь,
-                    // не похожая на да/нет, -> безопасное «нет» (для поиска
-                    // ответ из памяти, для отправки -- отмена). Только
-                    // ФИНАЛ Vosk + минимум речевой энергии -- иначе обрывки
-                    // шума отменяли бы подтверждение.
-                    val otherSpeech = isFinal &&
-                            !text.isNullOrBlank() &&
-                            confirmSpeechMs >= MIN_CONFIRM_SPEECH_MS
-                    when {
-                        answer == true -> {
-                            Log.i(TAG, "confirm: yes ($text)")
-                            playCue(Cue.EXECUTE)   // «принято, выполняю»
-                            state = State.SPEAKING
-                            updateNotification("Отправляю сообщение…")
-                            val token = confirmToken
-                            scope.launch { doConfirm(token, true) }
-                        }
-                        answer == false -> {
-                            Log.i(TAG, "confirm: no ($text)")
-                            playCue(Cue.CANCEL)    // «отмена»
-                            state = State.SPEAKING
-                            updateNotification("Отменено")
-                            val token = confirmToken
-                            scope.launch { doConfirm(token, false) }
-                        }
-                        otherSpeech -> {
-                            Log.i(TAG, "confirm: other speech -> no ($text)")
-                            playCue(Cue.CANCEL)
-                            state = State.SPEAKING
-                            updateNotification("Отменено")
-                            val token = confirmToken
-                            scope.launch { doConfirm(token, false) }
-                        }
-                        now > confirmDeadlineMs -> {
-                            Log.i(TAG, "confirm: timeout")
-                            state = State.WAKE
-                            updateNotification("Слушаю «Гемма»…")
-                        }
-                    }
-                    // NB: confirmToken -> pendingToken НЕ пишем: эта запись
-                    // перетирала свежий токен processCommand устаревшим
-                    // (баг «подтверждение уже истекло»). Токен двигается
-                    // только в одну сторону: processCommand -> pendingToken
-                    // -> confirmToken (на входе в CONFIRM).
-                }
-
-                // --- follow-up: дослушивание после ответа (фаза 4) --------
-                // Окно открыл openFollowUp после финального озвученного
-                // ответа. ТРИГГЕР -- не wake word, а речь (энергия >=
-                // SPEECH_RMS подряд FOLLOWUP_TRIG_MS): как только поймали,
-                // записываем вопрос дальше ПОЛНОСТЬЮ по правилам COMMAND
-                // (сюда же попадает stop-слово и «нет ввода» -- см. ветку
-                // no-input, она уводит в State.WAKE).
-                State.FOLLOWUP -> {
-                    ringWrite(frame, n)
-                    val rms = pcmRms(frame, n)
-                    val now = System.currentTimeMillis()
-                    if (rms >= SPEECH_RMS) {
-                        followupSpeechMs += 100
-                        followupAnySpeech = true   // речь уже была в окне
-                    } else {
-                        followupSpeechMs = 0
-                    }
-                    when {
-                        followupSpeechMs >= FOLLOWUP_TRIG_MS -> {
-                            // речь в окне: переходим в запись команды без
-                            // wake word -- та же механика, что после «Геммы»
-                            Log.i(TAG, "follow-up: speech (rms=$rms) -- record command (depth $followupDepth)")
-                            commandBuf.reset()
-                            speechInterrupted = false
-                            try {
-                                recognizer?.reset()
-                                wakeRecognizer?.reset()
-                            } catch (_: Exception) {
-                            }
-                            // первые слова сказаны ДО детекта энергии -- берём
-                            // хвост ring-буфера (как prelude после «Геммы»)
-                            val snap = ringSnapshot()
-                            val preludeBytes =
-                                COMMAND_PRELUDE_MS * SAMPLE_RATE * 2 / 1000
-                            val from = maxOf(0, snap.size - preludeBytes)
-                            commandBuf.write(snap, from, snap.size - from)
-                            startVoiceStream(snap.copyOfRange(from, snap.size))
-                            commandStartMs = now
-                            speechSeen = true
-                            lastSpeechMs = now
-                            rmsMax = rms
-                            lastWordsMs = 0L
-                            speechMsTotal = FOLLOWUP_TRIG_MS
-                            state = State.COMMAND
-                            updateNotification("Слушаю команду…")
-                            // Живой тест 30.10: после ответа в окне дослушивания
-                            // звучало 2 бипа (FOLLOWUP_WAIT при открытии окна +
-                            // LISTEN_START здесь) -- пользователь просил вместо
-                            // пары один. FOLLOWUP_WAIT остаётся, здесь бипа нет.
-                        }
-                        // тишина до конца окна (речи не было вовсе) --
-                        // обычное фоновое слушание
-                        now >= followupDeadlineMs && !followupAnySpeech -> {
-                            Log.i(TAG, "follow-up: silence ${FOLLOWUP_START_MS}ms -- back to wake")
-                            followupDepth = 0
-                            state = State.WAKE
-                            updateNotification("Слушаю «Гемма»…")
-                        }
-                        // речь была, но не дошла до триггера (шум/обрыв) --
-                        // держим окно ещё пару секунд и уходим
-                        now >= followupDeadlineMs + 2000 -> {
-                            Log.i(TAG, "follow-up: speech attempt failed -- back to wake")
-                            followupDepth = 0
-                            state = State.WAKE
-                            updateNotification("Слушаю «Гемма»…")
-                        }
-                    }
-                }
+                State.FOLLOWUP -> if (!handleFollowup(frame, n)) continue
             }
 
             // processCommand кладёт токен, а цикл CONFIRM должен его увидеть
-            if (state == State.CONFIRM && confirmToken == null) {
-                confirmToken = pendingToken.get()
+            if (session.state == State.CONFIRM && session.confirmToken == null) {
+                session.confirmToken = pendingToken.get()
             }
         }
 
@@ -1157,40 +1298,12 @@ class AssistantService : Service() {
         Log.i(TAG, "audio loop stopped")
     }
 
-    /** Кормит кадр в указанный Vosk; текст (partial или final) либо null. */
-    private fun feedRecognizer(
-        rec: Recognizer?, frame: ByteArray, size: Int
-    ): String? = feedRecognizerEx(rec, frame, size)?.second
-
-    /**
-     * Как [feedRecognizer], но с признаком финального результата:
-     * первый элемент Pair = true, если Vosk закончил фразу (финал).
-     * В CONFIRM фолбэк «прочая речь -> нет» срабатывает ТОЛЬКО на финале:
-     * на partial он слышал бы обрывки и отменял подтверждение по шуму.
-     */
-    private fun feedRecognizerEx(
-        rec: Recognizer?, frame: ByteArray, size: Int
-    ): Pair<Boolean, String>? {
-        if (rec == null) return null
-        return try {
-            // Vosk 0.3.75: acceptWaveForm(byte[], offset) возвращает true,
-            // когда найден конец речи (финальный результат).
-            if (rec.acceptWaveForm(frame.copyOf(size), size)) {
-                true to textOf(rec.result)
-            } else {
-                false to textOf(rec.partialResult)
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "recognizer error", t)
-            null
-        }
-    }
-
     /**
      * Проверка кандидата wake word ПОЛНЫМ распознавателем на кольцевом
      * буфере: требуем, чтобы свободный Vosk реально услышал слово,
-     * похожее на «гемму» (фонетическое расстояние <= 1 + белый список
-     * искажений) -- отсекает шум и случайные удары грамматики на фоне.
+     * похожее на «гемму» (критерий -- см. wakeWordHit в Recognition.kt:
+     * белый список искажений + расстояние <= 1 + фонетика == 0) --
+     * отсекает шум и случайные удары грамматики на фоне.
      */
     /** Результат верификации wake word полным распознавателем. */
     private enum class VerifyResult {
@@ -1230,28 +1343,16 @@ class AssistantService : Service() {
                 .replace(Regex("[^а-яёa-z ]"), " ")
                 .split(Regex("\\s+"))
                 .filter { it.isNotBlank() }
-            // «гемма» словарная -- свободный Vosk обычно слышит её точно.
-            // Список -- страховка на искажения и падежные формы: расстояние
-            // <= 1 до "гемма" уже ловит гамма/гема/емма/геммы, но список
-            // закрывает и случаи вроде "гемм". ЖИВЫЕ искажения голоса
-            // пользователя добавляем по логам wake verify heard: после теста
-            val wakeVariants = setOf(
-                "гемма", "геммы", "гемме", "гемму", "геммой", "гемм",
-                // слышимые искажения (фонетика ниже и так ловит часть
-                // из них, список -- страховка)
-                "гамма", "гема", "емма", "хемма", "темма"
-            )
-            // фонетика: сводим слово к классам звуков (гласные -- два
-            // класса, пары глухость/звонкость -- один символ) и сравниваем
-            // с «геммой» уже в этих координатах: «гамма»/«гема»/«емма»
-            // дают расстояние 0-1, а «плен»/«тлен»/«дом» -- 3+ и
-            // отсекаются
-            val target = phonetic(WAKE_PHONETIC)
-            if (words.any {
-                    it in wakeVariants ||
-                        editDistance(it, WAKE_PHRASE) <= 1 ||
-                        editDistance(phonetic(it), target) <= 1
-                }) {
+            // Критерий MATCH -- общий wakeWordHit (Recognition.kt):
+            // белый список WAKE_VARIANTS + префикс wake-фразы + расстояние
+            // <= 1 до фразы либо фонетическое == 0. ПОРОГ == 0 (раньше
+            // <= 1) сохранён: дистанция 1 давала ложные срабатывания на
+            // бытовых словах («кино»/«зима»/«тима»/«лимa»/«гимн» -- все
+            // d_ph=1 до "gima"; лог 05.11 22:51: verify heard 'кино кино'
+            // -> hit). Живые искажения «Геммы» («димо»/«демо»/«дима»/
+            // «модема») добавлены в WAKE_VARIANTS по логам smoke-f3-5b;
+            // новое искажение добавляем туда же по логам wake verify heard.
+            if (words.any { wakeWordHit(it, WAKE_PHRASE) }) {
                 VerifyResult.MATCH
             } else {
                 VerifyResult.MISMATCH
@@ -1260,87 +1361,6 @@ class AssistantService : Service() {
             Log.e(TAG, "wake verify error", t)
             VerifyResult.EMPTY
         }
-    }
-
-    /** Расстояние Левенштейна (для сопоставления «гемма»/«геммы»/…). */
-    private fun editDistance(a: String, b: String): Int {
-        val m = a.length
-        val n = b.length
-        if (m == 0) return n
-        if (n == 0) return m
-        var prev = IntArray(n + 1) { it }
-        val cur = IntArray(n + 1)
-        for (i in 1..m) {
-            cur[0] = i
-            for (j in 1..n) {
-                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
-                cur[j] = minOf(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
-            }
-            // cur полностью перезаписан -- можно копировать в prev
-            System.arraycopy(cur, 0, prev, 0, n + 1)
-        }
-        return prev[n]
-    }
-
-    /**
-     * Грубая фонетическая нормализация слова для сравнения с wake word.
-     *
-     * Малая модель Vosk постоянно путает похожие звуки, поэтому сводим
-     * оба слова к классам звуков и сравниваем уже в них:
-     *   - гласные двух типов: открытые «а/о/у» -> 'a', закрытые
-     *     «е/ё/и/ы/э/ю/я» -> 'i' («гемма» -> "gima", «гамма» -> "gima");
-     *   - пары глухость/звонкость -> один символ (г/к -> g, д/т -> t,
-     *     б/п -> p, в/ф -> f, ж/ш -> z, з/с -> s), т.к. малая модель
-     *     путает их постоянно;
-     *   - «й/ь/ъ» и удвоения выпадают («геммы» -> "gima").
-     * Так «гамма»/«гема»/«емма» дают расстояние 0-1 к "gima", а «плен»
-     * ("plin"~3), «тлен» ("tlin"~3), «дом» ("tam"~3) -- отсекаются.
-     */
-    private fun phonetic(word: String): String {
-        val sb = StringBuilder(word.length)
-        for (ch in word) {
-            when (ch) {
-                'а', 'о', 'у' -> sb.append('a')
-                'е', 'ё', 'и', 'ы', 'э', 'ю', 'я' -> sb.append('i')
-                'г', 'к' -> sb.append('g')
-                'д', 'т' -> sb.append('t')
-                'б', 'п' -> sb.append('p')
-                'в', 'ф' -> sb.append('f')
-                'ж', 'ш' -> sb.append('z')
-                'з', 'с' -> sb.append('s')
-                'х' -> sb.append('h')
-                'м' -> sb.append('m')
-                'н' -> sb.append('n')
-                'л' -> sb.append('l')
-                'р' -> sb.append('r')
-                'ц', 'ч', 'щ' -> sb.append('c')
-                'й', 'ь', 'ъ' -> { /* выпадают: не несут класс звука */ }
-                else -> sb.append(ch)    // латиница и прочее -- как есть
-            }
-            // удвоение согласных не несёт смысла: "гемм" -> "gim"
-            if (sb.length >= 2 && sb[sb.length - 1] == sb[sb.length - 2] &&
-                sb[sb.length - 1] !in "ai"
-            ) {
-                sb.deleteCharAt(sb.length - 1)
-            }
-        }
-        return sb.toString()
-    }
-
-    /** Среднеквадратичное отклонение кадра -- энергия голоса. */
-    private fun pcmRms(pcm: ByteArray, size: Int, offset: Int = 0): Int {
-        var sum = 0L
-        var count = 0
-        val end = offset + size
-        var i = offset
-        while (i + 1 < end) {
-            val v = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
-            val s = if (v >= 32768) v - 65536 else v
-            sum += s.toLong() * s
-            count++
-            i += 2
-        }
-        return if (count == 0) 0 else Math.sqrt(sum.toDouble() / count).toInt()
     }
 
     /** Фазы звуковой подсказки (план, фаза 3, п. 8–9) + верификация. */
@@ -1537,39 +1557,6 @@ class AssistantService : Service() {
         }.start()
     }
 
-    private fun textOf(json: String): String =
-        try {
-            JSONObject(json).optString("text").ifBlank {
-                JSONObject(json).optString("partial")
-            }
-        } catch (_: Exception) {
-            json
-        }
-
-    /** Пиковая амплитуда PCM (0..32767) — для диагностики уровня микрофона. */
-    private fun pcmPeak(pcm: ByteArray): Int {
-        var peak = 0
-        var i = 0
-        while (i + 1 < pcm.size) {
-            val v = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
-            val s = if (v >= 32768) v - 65536 else v
-            val a = if (s < 0) -s else s
-            if (a > peak) peak = a
-            i += 2
-        }
-        return peak
-    }
-
-    private fun classifyAnswer(text: String): Boolean? {
-        val words = text.lowercase()
-            .replace(Regex("[^а-яёa-z ]"), " ")
-            .split(Regex("\\s+"))
-            .filter { it.isNotBlank() }
-        if (words.any { it in NO_WORDS || it in STOP_WORDS }) return false
-        if (words.any { it in YES_WORDS }) return true
-        return null // не разобрали — продолжаем слушать
-    }
-
     // ------------------------------------------------------------------
     // Сеть + озвучка (scope, IO)
     // ------------------------------------------------------------------
@@ -1645,7 +1632,7 @@ class AssistantService : Service() {
                     }
                     // стрим упал: если мы уже ждём reply (state=SPEAKING) --
                     // ответа не будет, отвечаем по фолбэку POST wav
-                    if (state == State.SPEAKING && streamReply == null &&
+                    if (session.state == State.SPEAKING && streamReply == null &&
                         !streamChunkSeen
                     ) {
                         Log.w(TAG, "stream died before reply -- " +
@@ -1660,7 +1647,6 @@ class AssistantService : Service() {
         }.also { it.setPrelude(prelude) }
     }
 
-    /** Итог потоковой сессии: озвучка wav с сервера + CONFIRM/WAKE. */
     /**
      * Открывает окно дослушивания (фаза 4, follow-up) после финального
      * ответа: пользователь может продолжить БЕЗ wake word («а завтра?»).
@@ -1672,13 +1658,13 @@ class AssistantService : Service() {
         needReset = true
         if (followupDepth >= MAX_FOLLOWUP) {
             followupDepth = 0
-            state = State.WAKE
+            transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
             return
         }
         followupDepth++
         followupDeadlineMs = System.currentTimeMillis() + FOLLOWUP_START_MS
-        state = State.FOLLOWUP
+        transition(State.SPEAKING, State.FOLLOWUP)
         updateNotification("Слушаю продолжение…")
         // бип «слушаю продолжение» (жалоба 30.10): без него окно было
         // единственным слушающим состоянием молча -- непонятно, что
@@ -1688,6 +1674,12 @@ class AssistantService : Service() {
                 "(${FOLLOWUP_START_MS}ms) after $reason")
     }
 
+    /**
+     * Итог потоковой сессии: озвучка wav с сервера (при стриме -- ждём
+     * конца очереди чанков, повторно НЕ озвучиваем) + переход в CONFIRM
+     * (streamConfirm с токеном) / окно дослушивания [openFollowUp] /
+     * WAKE (прерывание стоп-словом или ошибка).
+     */
     private fun finishStreamReply() {
         val stream = voiceStream
         try {
@@ -1713,7 +1705,7 @@ class AssistantService : Service() {
                 Log.i(TAG, "reply interrupted by stop word -- back to wake")
                 speechInterrupted = false
                 needReset = true
-                state = State.WAKE
+                transition(State.SPEAKING, State.WAKE)
                 updateNotification("Слушаю «Гемма»…")
                 return
             }
@@ -1721,7 +1713,7 @@ class AssistantService : Service() {
             if (streamConfirm && streamToken != null) {
                 needReset = true
                 pendingToken.set(streamToken)
-                state = State.CONFIRM
+                transition(State.SPEAKING, State.CONFIRM)
                 playCue(Cue.CONFIRM_WAIT)
                 updateNotification("Жду «да» или «отмена»…")
             } else {
@@ -1729,12 +1721,17 @@ class AssistantService : Service() {
                 // продолжать БЕЗ «Геммы»; лимит глубины -- внутри
                 openFollowUp("stream reply")
             }
+        } catch (e: CancellationException) {
+            // отмена scope (onDestroy) -- РЕПРОВЕРГАЕМ: иначе фолбэк-озвучка
+            // и переходы state глотали бы отмену корутины (работа после смерти
+            // сервиса). Обрывы сети сюда не приходят (они ниже, общий catch).
+            throw e
         } catch (t: Throwable) {
             Log.e(TAG, "stream reply failed", t)
             speak("Не получилось связаться с сервером.")
             speechInterrupted = false
             needReset = true
-            state = State.WAKE
+            transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
         } finally {
             try {
@@ -1765,7 +1762,7 @@ class AssistantService : Service() {
                 Log.i(TAG, "reply interrupted by stop word -- back to wake")
                 speechInterrupted = false
                 needReset = true
-                state = State.WAKE
+                transition(State.SPEAKING, State.WAKE)
                 updateNotification("Слушаю «Гемма»…")
                 return
             }
@@ -1773,7 +1770,7 @@ class AssistantService : Service() {
             if (needsConfirm && token != null) {
                 needReset = true
                 pendingToken.set(token)
-                state = State.CONFIRM
+                transition(State.SPEAKING, State.CONFIRM)
                 // Замечание 28.10: после объявления нужен звук, что сервис
                 // слушает ответ -- иначе непонятно, когда говорить «да».
                 playCue(Cue.CONFIRM_WAIT)
@@ -1782,12 +1779,16 @@ class AssistantService : Service() {
                 // финальный ответ -> окно дослушивания (фаза 4)
                 openFollowUp("reply")
             }
+        } catch (e: CancellationException) {
+            // отмена scope -- rethrow (см. finishStreamReply); обрыв сети
+            // (IOException) идёт в общий catch ниже: лог + фолбэк-озвучка
+            throw e
         } catch (t: Throwable) {
             Log.e(TAG, "command failed", t)
             speak("Не получилось связаться с сервером.")
             speechInterrupted = false
             needReset = true
-            state = State.WAKE
+            transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
         }
     }
@@ -1812,6 +1813,10 @@ class AssistantService : Service() {
             } else {
                 speak("Подтверждение потеряно.")
             }
+        } catch (e: CancellationException) {
+            // отмена scope -- rethrow (см. finishStreamReply); обрыв сети
+            // (IOException) идёт в общий catch ниже: лог + «Ошибка отправки.»
+            throw e
         } catch (t: Throwable) {
             Log.e(TAG, "confirm failed", t)
             speak("Ошибка отправки.")
@@ -1826,7 +1831,7 @@ class AssistantService : Service() {
             // звонок: окно дослушивания НЕ открываем (dialer перехватывает
             // микрофон) -- сразу фоновое слушание
             followupDepth = 0
-            state = State.WAKE
+            transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
             placeCall(callContact)
             return
@@ -1834,7 +1839,7 @@ class AssistantService : Service() {
         if (interrupted) {
             Log.i(TAG, "confirm reply interrupted by stop word -- back to wake")
             followupDepth = 0
-            state = State.WAKE
+            transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
             return
         }
@@ -1883,46 +1888,6 @@ class AssistantService : Service() {
             Log.e(TAG, "dial failed", t)
             speak("Не получилось позвонить: нет разрешения или недоступно.")
         }
-    }
-
-    /**
-     * Контакты, чьё имя содержит [name] (без учёта регистра), -- пары
-     * (имя, первый номер). Ищем в CommonDataKinds.Phone: там и имя, и
-     * номер в одной таблице. Требует READ_CONTACTS.
-     */
-    private fun findContacts(name: String): List<Pair<String, String>> {
-        val out = mutableListOf<Pair<String, String>>()
-        val seen = mutableSetOf<String>()
-        try {
-            contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Phone.NUMBER
-                ),
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-                arrayOf("%$name%"),
-                null
-            )?.use { c ->
-                val nameIdx = c.getColumnIndex(
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                val numIdx = c.getColumnIndex(
-                    ContactsContract.CommonDataKinds.Phone.NUMBER)
-                while (c.moveToNext()) {
-                    val dn = c.getString(nameIdx) ?: continue
-                    val ph = c.getString(numIdx)?.filter {
-                        it.isDigit() || it == '+'
-                    } ?: continue
-                    if (ph.isEmpty()) continue
-                    // один контакт может иметь несколько номеров --
-                    // берём первый, по имени -- без дублей
-                    if (seen.add(dn)) out.add(dn to ph)
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "contact query failed", t)
-        }
-        return out
     }
 
     /**
@@ -1992,94 +1957,39 @@ class AssistantService : Service() {
         }
     }
 
-    /** Играет один WAV-чанк под SPEAK_LOCK (логика speakLocked). */
+    /** Играет один WAV-чанк под SPEAK_LOCK (общая механика -- [playWavLocked]). */
     private fun playChunkLocked(wav: ByteArray) {
+        playWavLocked("chunk.wav", "chunk") { wav }
+    }
+
+    /**
+     * Озвучка одного wav под SPEAK_LOCK: временный файл -> MediaPlayer ->
+     * ожидание конца с паузами барж-ина; cleanup (плеер/флаги) в finally.
+     * Общая механика [speakLocked] и [playChunkLocked].
+     *
+     * [obtainWav] вызывается ПЕРВЫМ внутри try: speakLocked получает wav
+     * (/tts) здесь же, чтобы ранние return'ы (пустой wav, стоп-слово во
+     * время запроса) проходили через тот же finally/cleanup, что и раньше.
+     * [wavFile] и [tag] различают владельцев -- reply.wav/«speak»
+     * (speakLocked) и chunk.wav/«chunk» (playChunkLocked): имена файлов и
+     * тексты логов совпадают с прежними.
+     */
+    private fun playWavLocked(
+        wavFile: String,
+        tag: String,
+        obtainWav: () -> ByteArray?
+    ) {
         val latch = CountDownLatch(1)
         speakLatch = latch
         var player: MediaPlayer? = null
         try {
-            val file = File(cacheDir, "chunk.wav")
+            val wav = obtainWav() ?: return
+            val file = File(cacheDir, wavFile)
             file.writeBytes(wav)
             val p = MediaPlayer()
             player = p
             p.setDataSource(file.absolutePath)
             p.setOnCompletionListener { latch.countDown() }
-            p.setOnErrorListener { _, _, _ ->
-                latch.countDown()
-                false
-            }
-            p.prepare()
-            if (speechInterrupted) return
-            p.setVolume(1.5f, 1.5f)
-            p.start()
-            speakPlayer = p
-            playbackSeen = true
-            playbackStartMs = System.currentTimeMillis()
-            while (!latch.await(40, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                if (speechInterrupted) break
-                if (speakPauseReq) {
-                    speakPauseReq = false
-                    try {
-                        if (p.isPlaying) p.pause()
-                    } catch (_: Exception) {
-                    }
-                }
-                if (speakResumeReq) {
-                    speakResumeReq = false
-                    try {
-                        p.start()
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "chunk play failed", t)
-            latch.countDown()
-        } finally {
-            speakLatch = null
-            speakPlayer = null
-            speakPauseReq = false
-            speakResumeReq = false
-            if (speechInterrupted) {
-                try {
-                    player?.stop()
-                } catch (_: Exception) {
-                }
-                Log.i(TAG, "chunk interrupted by stop word")
-            }
-            try {
-                player?.release()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun speakLocked(text: String, preWav: ByteArray? = null) {
-        if (text.isBlank()) return
-        if (speechInterrupted) return     // стоп-слово до начала озвучки
-        val latch = CountDownLatch(1)
-        speakLatch = latch
-        var player: MediaPlayer? = null
-        try {
-            // preWav из стрима может быть пустым (сервер прислал событие
-            // без аудио) -- раньше такой ответ МОЛЧА пропускался (жалоба
-            // 30.10 «один из запросов не был озвучен»); теперь -- фолбэк
-            // на обычный /tts по тексту
-            val wav = if (preWav != null && preWav.isNotEmpty()) preWav
-                      else ServerClient.tts(server, text)
-            if (wav.isEmpty()) {
-                Log.w(TAG, "tts: empty wav for '$text'")
-                return
-            }
-            if (speechInterrupted) return  // стоп-слово во время запроса TTS
-            val file = File(cacheDir, "reply.wav")
-            file.writeBytes(wav)
-            val p = MediaPlayer()
-            player = p
-            p.setDataSource(file.absolutePath)
-            p.setOnCompletionListener {
-                latch.countDown()
-            }
             p.setOnErrorListener { _, _, _ ->
                 latch.countDown()
                 false
@@ -2112,7 +2022,7 @@ class AssistantService : Service() {
                 }
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "speak failed", t)
+            Log.e(TAG, "$tag failed", t)
             latch.countDown()
         } finally {
             speakLatch = null
@@ -2124,7 +2034,7 @@ class AssistantService : Service() {
                     player?.stop()
                 } catch (_: Exception) {
                 }
-                Log.i(TAG, "speak interrupted by stop word")
+                Log.i(TAG, "$tag interrupted by stop word")
             }
             try {
                 player?.release()
@@ -2133,60 +2043,38 @@ class AssistantService : Service() {
         }
     }
 
+    private fun speakLocked(text: String, preWav: ByteArray? = null) {
+        if (text.isBlank()) return
+        if (speechInterrupted) return     // стоп-слово до начала озвучки
+        playWavLocked("reply.wav", "speak") {
+            // preWav из стрима может быть пустым (сервер прислал событие
+            // без аудио) -- раньше такой ответ МОЛЧА пропускался (жалоба
+            // 30.10 «один из запросов не был озвучен»); теперь -- фолбэк
+            // на обычный /tts по тексту
+            val wav = if (preWav != null && preWav.isNotEmpty()) preWav
+                      else ServerClient.tts(server, text)
+            if (wav.isEmpty()) {
+                Log.w(TAG, "tts: empty wav for '$text'")
+                return@playWavLocked null
+            }
+            if (speechInterrupted) return@playWavLocked null  // стоп-слово во время запроса TTS
+            wav
+        }
+    }
+
     // ------------------------------------------------------------------
     // Служебное: уведомление, foreground, wake lock
     // ------------------------------------------------------------------
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Ассистент Гемма",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { setShowBadge(false) }
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(text: String): Notification {
-        val openApp = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("Гемма")
-            .setContentText(text)
-            .setContentIntent(openApp)
-            .setOngoing(true)
-            .setSilent(true)
-            .build()
-    }
-
-    private fun startForegroundCompat() {
-        val notif = buildNotification("Запуск…")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID, notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notif)
-        }
-    }
-
-    private fun updateNotification(text: String) {
-        try {
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                .notify(NOTIFICATION_ID, buildNotification(text))
-        } catch (_: Exception) {
-        }
-    }
-
     private fun acquireWakeLock() {
+        // Повторный onStartCommand при живом сервисе: объект уже удерживается,
+        // второй объект без таймаута протёк бы до смерти процесса
+        if (wakeLock?.isHeld == true) return
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gemma:audio").apply {
             setReferenceCounted(false)
-            acquire(10 * 60 * 1000L) // не держим вечно — сервис перезапускается
+            // Без таймаута: иначе длинный диалог/стрим молча теряет wake-lock
+            // по истечении 10 мин. release() гарантирован в onDestroy (finally)
+            acquire()
         }
     }
 }

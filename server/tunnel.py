@@ -43,8 +43,10 @@ import logging
 import secrets
 import socket
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import uvicorn
@@ -62,7 +64,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(BASE_DIR / "tunnel.log", encoding="utf-8"),
+        RotatingFileHandler(BASE_DIR / "tunnel.log", maxBytes=5 * 1024 * 1024,
+                            backupCount=3, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("tunnel")
@@ -103,7 +106,10 @@ async def tunnel(ws: WebSocket) -> None:
 
     # ---------------- аутентификация (первый кадр или ?token=) -----------
     token = settings.api_token
-    authed = bool(token) and ws.query_params.get("token") == token
+    # compare_digest на str падает TypeError на не-ASCII -- сравниваем байты
+    authed = bool(token) and secrets.compare_digest(
+        (ws.query_params.get("token") or "").encode(),
+        token.encode())
     if authed:
         pass
     elif not token:
@@ -128,9 +134,11 @@ async def tunnel(ws: WebSocket) -> None:
             fr = json.loads(text)
         except (ValueError, TypeError):
             continue
+        if not isinstance(fr, dict):
+            continue
         if fr.get("t") == "open":
             got = str(fr.get("token") or "")
-            if secrets.compare_digest(got, token):
+            if secrets.compare_digest(got.encode(), token.encode()):
                 authed = True
             else:
                 await send({"t": "err", "m": "bad token"})
@@ -149,7 +157,11 @@ async def tunnel(ws: WebSocket) -> None:
                                timeout=httpx.Timeout(600.0, connect=5.0))
 
     async def handle_req(fr: dict[str, Any]) -> None:
-        sid = int(fr.get("id") or 0)
+        try:
+            sid = int(fr.get("id") or 0)
+        except (TypeError, ValueError):
+            log.warning("bad req id from %s: %r", peer, fr.get("id"))
+            return
         try:
             method = str(fr.get("m") or "GET").upper()
             path = str(fr.get("p") or "/")
@@ -183,6 +195,7 @@ async def tunnel(ws: WebSocket) -> None:
             log.info("sub-stream %d ended: %s", sid, exc)
         finally:
             streams.pop(sid, None)
+            pumps.pop(sid, None)
             try:
                 await sock.close()
             except Exception:  # noqa: BLE001
@@ -211,13 +224,22 @@ async def tunnel(ws: WebSocket) -> None:
             except (ValueError, TypeError):
                 log.warning("bad frame from %s: %.80s", peer, text)
                 continue
+            if not isinstance(fr, dict):
+                # JSON-массив/строка вместо объекта: .get() рвал бы канал
+                log.warning("non-object frame from %s", peer)
+                continue
+            try:
+                sid = int(fr.get("id") or 0)
+            except (TypeError, ValueError):
+                log.warning("bad frame id from %s: %.80s", peer, text)
+                continue
             t = fr.get("t")
             if t == "ping":
                 await send({"t": "pong"})
             elif t == "req":
                 asyncio.ensure_future(handle_req(fr))
             elif t == "ws_open":
-                sid, path = int(fr.get("id") or 0), str(fr.get("p") or "")
+                path = str(fr.get("p") or "")
                 if sid in streams or ws_connect is None:
                     continue
                 if not path.startswith("/ws"):
@@ -225,9 +247,10 @@ async def tunnel(ws: WebSocket) -> None:
                                 "r": "path not allowed"})
                     continue
                 try:
-                    sock = await ws_connect(
-                        f"ws://127.0.0.1:{settings.port}{path}",
-                        max_size=MAX_BODY)
+                    sep = "&" if "?" in path else "?"
+                    url = (f"ws://127.0.0.1:{settings.port}{path}{sep}"
+                           f"token={quote(settings.api_token)}")
+                    sock = await ws_connect(url, max_size=MAX_BODY)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("sub-stream open %s failed: %s", path, exc)
                     await send({"t": "ws_closed", "id": sid, "c": 1011,
@@ -236,18 +259,23 @@ async def tunnel(ws: WebSocket) -> None:
                 streams[sid] = sock
                 pumps[sid] = asyncio.ensure_future(pump(sid, sock))
             elif t == "ws_data":
-                sock = streams.get(int(fr.get("id") or 0))
+                sock = streams.get(sid)
                 if sock is not None:
-                    data = base64.b64decode(fr.get("b") or b"")
+                    try:
+                        data = base64.b64decode(fr.get("b") or b"")
+                    except (ValueError, TypeError):
+                        # binascii.Error -- подкласс ValueError; TypeError --
+                        # не-str/bytes в поле b (число и т.п.)
+                        log.warning("bad b64 frame, skipped")
+                        continue
                     if len(data) > MAX_BODY:
                         continue
                     await sock.send(data)
             elif t == "ws_text":
-                sock = streams.get(int(fr.get("id") or 0))
+                sock = streams.get(sid)
                 if sock is not None:
                     await sock.send(str(fr.get("x") or ""))
             elif t == "ws_close":
-                sid = int(fr.get("id") or 0)
                 task = pumps.pop(sid, None)
                 if task is not None:
                     task.cancel()

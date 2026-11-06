@@ -1,0 +1,152 @@
+import asyncio
+import logging
+import time
+
+import llm
+from api_models import AskResponse, VoiceResponse
+from dialog_state import (
+    _digest_text,
+    _history_digest,
+    add_turn,
+    get_history,
+    reset_history,
+    wants_forget,
+)
+from dispatch import _dispatch
+from profile_detect import detect_profile_command
+
+log = logging.getLogger("assistant")
+
+
+async def _answer(text: str,
+                  on_sentence=None,
+                  on_first_token=None,
+                  on_query=None) -> AskResponse:
+    """Общая цепочка: текст -> решение модели -> действие -> ответ.
+
+    on_sentence/on_first_token/on_query (фаза 6, п. 1) -- включают
+    стриминговый путь decide_stream: предложения reply уходят на озвучку,
+    пока генерация ещё идёт (первый токен ~0.3-0.5 с вместо ожидания
+    полного ответа). Без них -- прежний decide() (POST /voice, /ask).
+    """
+    t0 = time.perf_counter()
+    log.info("ask: %r", text)
+
+    # Явный сброс контекста -- локально, мимо модели (быстро и надёжно).
+    if wants_forget(text):
+        await reset_history()
+        return VoiceResponse(
+            reply="Хорошо, начал новый разговор. Слушаю.",
+            action="none", args={}, needs_confirm=False, token=None,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+    # Команды профиля -- тоже локально, без LLM (быстро + надёжно).
+    pcmd = detect_profile_command(text)
+    if pcmd is not None:
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        if pcmd == "get":
+            reply = f"Сейчас профиль: {llm.get_profile_label()}."
+        elif pcmd == "list":
+            labels = ", ".join(p["label"] for p in llm.list_profiles())
+            reply = (f"Профили: {labels}. Скажи, например, "
+                     f"«профиль цундере».")
+        elif pcmd.startswith("set:"):
+            pid = pcmd.split(":", 1)[1]
+            llm.set_profile(pid)
+            # Новый характер -- новый разговор: старая история (сухие
+            # реплики без характера) тянет ответы в прежний нейтральный
+            # тон, и 4B-модель повторяет её сильнее, чем system-промпт
+            # (живой тест 29.10: после смены на дередере отвечала
+            # нейтрально, пока история не сброшена).
+            await reset_history()
+            # подтверждение уже НОВЫМ профилем -> слышна смена манеры
+            reply = f"Хорошо, теперь я — {llm.get_profile_label()}."
+        else:
+            reply = "Не понял, какой профиль."
+        log.info("profile cmd %r -> %r", text, reply)
+        return VoiceResponse(reply=reply, action="none", args={},
+                             needs_confirm=False, token=None,
+                             elapsed_ms=elapsed)
+
+    # Быстрый путь БЕЗ LLM (фаза 6, п. 2): время/число/день недели ->
+    # готовый шаблон на сервере (~0 мс вместо 2-7 с генерации).
+    fast = llm.fast_reply(text)
+    if fast is not None:
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        log.info("fast reply in %d ms: %r", elapsed, fast)
+        # ходы в историю -- чтобы уточнения («а завтра?») видели вопрос
+        await add_turn("user", text)
+        await add_turn("assistant", _digest_text(fast))
+        return VoiceResponse(reply=fast, action="none", args={},
+                             needs_confirm=False, token=None,
+                             elapsed_ms=elapsed)
+
+    history = await get_history()
+    t_llm = time.perf_counter()
+
+    # Стриминговый путь (фаза 6, п. 1): decide_stream шлёт готовые
+    # предложения через on_sentence, пока генерация ещё идёт.
+    # llama-стрим блокирующий (httpx) -> в отдельном потоке.
+    if on_sentence is not None:
+        spoken: list[str] = []
+
+        def _on_sentence(s: str) -> None:
+            spoken.append(s)
+            try:
+                on_sentence(s)
+            except Exception:
+                log.warning("on_sentence failed", exc_info=True)
+
+        first_ms: list[int] = []
+
+        def _first() -> None:
+            first_ms.append(int((time.perf_counter() - t_llm) * 1000))
+            if on_first_token is not None:
+                try:
+                    on_first_token()
+                except Exception:
+                    log.warning("on_first_token failed", exc_info=True)
+
+        def _run() -> llm.Decision:
+            return llm.decide_stream(text, history, on_sentence=_on_sentence,
+                                     on_first_token=_first, on_query=on_query)
+
+        try:
+            decision = await asyncio.to_thread(_run)
+        except Exception:
+            log.exception("decide_stream failed")
+            decision = llm.Decision(
+                reply="Сервер модели не отвечает, попробуй ещё раз.",
+                action="none")
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+        log.info("decision: action=%s args=%s (llm stream %d ms, "
+                 "first_token=%s, spoken=%d sentences)",
+                 decision.action, decision.args, llm_ms,
+                 first_ms[0] if first_ms else None, len(spoken))
+    else:
+        try:
+            decision = await asyncio.to_thread(llm.decide, text, history)
+        except Exception:
+            log.exception("decide failed")
+            decision = llm.Decision(
+                reply="Сервер модели не отвечает, попробуй ещё раз.",
+                action="none")
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+        log.info("decision: action=%s args=%s (llm %d ms)",
+                 decision.action, decision.args, llm_ms)
+
+    reply, needs_confirm, token = await _dispatch(decision)
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    log.info("reply in %d ms: %r", elapsed, reply)
+    # В историю кладём реплику ассистента в JSON-схеме {reply, action, args}
+    # (фикс 30.10): формат истории == формат ответа модели держит её в режиме
+    # схемы. Проза в истории ломала JSON у Gemma-4-E4B (action=search терялся),
+    # Qwen она не ломала, но JSON-история ей не мешает (бенч до/после идентичен).
+    await add_turn("user", text)
+    await add_turn("assistant", _history_digest(decision, reply))
+    # VoiceResponse — наследник AskResponse с полями text/stt_ms (с дефолтами);
+    # /ask отдаёт его через response_model=AskResponse, лишние поля отфильтруются.
+    return VoiceResponse(reply=reply, action=decision.action, args=decision.args,
+                         needs_confirm=needs_confirm, token=token,
+                         elapsed_ms=elapsed)

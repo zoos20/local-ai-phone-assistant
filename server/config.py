@@ -71,7 +71,9 @@ class Settings(BaseSettings):
     # Сохранять аудио, реально ушедшее в whisper -> stt_debug/ для
     # прослушивания (что модель получила: срезало VAD начало или
     # whisper искажает). Храним только последние stt_debug_keep файлов.
-    stt_debug: bool = True
+    # По умолчанию ВЫКЛ: голосовые записи на диск не пишем; включается
+    # ASSISTANT_STT_DEBUG=true для отладки STT.
+    stt_debug: bool = False
     stt_debug_dir: str = str(BASE_DIR / "stt_debug")
     stt_debug_keep: int = 30
     # Сколько результатов поиска отдаём модели для пересказа
@@ -88,6 +90,28 @@ class Settings(BaseSettings):
     def _empty_int(cls, v: object) -> object:
         # Пустая строка в .env (ASSISTANT_TG_API_ID=) -> "не задано".
         return 0 if v == "" else v
+
+    @field_validator("api_token")
+    @classmethod
+    def _token_ascii(cls, v: str) -> str:
+        """Токен обязан быть ASCII -- иначе отказ ещё на старте (п. 2.4 A1).
+
+        Сравнение идёт secrets.compare_digest(...) по байтам в трёх местах
+        (HTTP-мидлварь, /ws_voice query-параметр, tunnel.py), а приходит
+        токен строкой: не-ASCII символы неоднозначно кодируются клиентом
+        (latin-1 в заголовках, UTF-8 в query) -> TypeError/тихое
+        несовпадение уже ПОСЛЕ старта, в рантайме. Проверяем один раз
+        при конфигурации. Пустой токен (режим «только LAN») -- валиден.
+        """
+        if v and not v.isascii():
+            raise ValueError(
+                "ASSISTANT_API_TOKEN должен состоять из ASCII-символов "
+                "(латиница/цифры/знаки препинания): не-ASCII токен ломает "
+                "сравнение compare_digest в HTTP-мидлваре, /ws_voice и "
+                "tunnel.py. Задай токен латиницей либо оставь пустым "
+                "(режим только LAN)."
+            )
+        return v
 
 
 settings = Settings()
