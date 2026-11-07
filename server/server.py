@@ -10,11 +10,15 @@
     POST /voice           — multipart аудио -> распознавание -> как /ask + "text"
     POST /tts             — {"text": "..."} -> WAV (озвучка ответа)
     POST /confirm         — {"token": "...", "yes": true|false} -> выполнить/отменить
+    GET  /update/manifest — manifest.json релиза APK (обновление по воздуху)
+    GET  /update/apk      — скачивание APK (телефон ставит обновление)
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator
@@ -24,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 import llm
 import tools
@@ -375,6 +379,176 @@ async def cert_fingerprint() -> dict[str, Any]:
     # file -- только basename: полный путь серверной файловой системы
     # наружу (на телефон) не отдаём, ключи ответа не меняем.
     return {"fingerprint_sha256": hexs, "pin": pin, "file": cert_path.name}
+
+
+# --------------------------------------------------------------------------
+# Беспроводное обновление Android-приложения (фича wireless-update):
+# телефон дёргает /update/manifest («есть ли новая версия?») и качает
+# /update/apk. Оба эндпоинта -- под токеном: в _TOKEN_EXEMPT их НЕ
+# добавляем (мидлварь require_api_token оборачивает все пути, пустой
+# api_token = LAN-only режим — задумано). Каталог релизов — settings.apk_dir,
+# наполняет scripts/build-apk.ps1 (там же структура manifest.json).
+# --------------------------------------------------------------------------
+# Верхняя граница чтения manifest.json: клиент принимает манифесты до 64 КБ,
+# нормальный -- ~300 байт (см. комментарий в _load_update_manifest).
+_MANIFEST_MAX_BYTES = 64 * 1024
+
+
+def _load_update_manifest() -> dict[str, Any]:
+    """Читает и валидирует manifest.json; битый/отсутствующий -> 404.
+
+    Один helper на оба эндпоинта: /update/apk берёт имя файла из поля
+    `file` манифеста, поэтому манифест обязан быть валиден и там, и там.
+    """
+    # Лимит на чтение (финальное ревью): клиент (Android) принимает
+    # manifest.json до 64 КБ, нормальный -- ~300 байт, так что 64 КБ -- это
+    # огромный запас при жёстком ограничении памяти/времени парсинга:
+    # гигантский файл вообще не читаем (иначе MemoryError = 500).
+    manifest_path = Path(settings.apk_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        log.warning("update: manifest отсутствует: %s", manifest_path)
+        # В detail путей сервера НЕ даём (наружу уходит только то, что
+        # нужно телефону); полный путь -- в log.warning выше (QA #4).
+        raise HTTPException(
+            status_code=404,
+            detail="manifest.json не найден: собери релиз "
+                   "через scripts/build-apk.ps1",
+        )
+    try:
+        # Проверка размера ДО чтения: stat внутри того же try, что и
+        # чтение, -- исчезновение файла между is_file() и stat() тоже
+        # уйдёт в OSError-ветку (404), а не в 500.
+        if manifest_path.stat().st_size > _MANIFEST_MAX_BYTES:
+            log.warning("update: manifest больше лимита %d: %s",
+                        _MANIFEST_MAX_BYTES, manifest_path)
+            # HTTPException ни в одну ветку except не попадает -- выходит наружу.
+            raise HTTPException(
+                status_code=404,
+                detail=f"manifest.json слишком большой (лимит "
+                       f"{_MANIFEST_MAX_BYTES // 1024} КБ)",
+            )
+        # utf-8-sig: терпит BOM, если манифест пересохраняли из Windows.
+        data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        # str(OSError) несёт полный путь файла -> в detail его не даём,
+        # только в лог (QA #4).
+        log.warning("update: manifest не читается: %s (%s)",
+                    manifest_path, exc)
+        raise HTTPException(
+            status_code=404,
+            detail="manifest.json не удалось прочитать",
+        ) from exc
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # RecursionError: глубокая вложенность в пределах лимита размера
+        # (проверено: 5000+ уровней массива -> RecursionError, а не
+        # JSONDecodeError) -- раньше это было 500 вместо 404.
+        # Сообщение ошибки пути не содержит -- оставляем его в detail:
+        # по нему видно, что именно не так с файлом.
+        log.warning("update: manifest не парсится: %s (%s)",
+                    manifest_path, exc)
+        raise HTTPException(
+            status_code=404,
+            detail=f"manifest.json повреждён, не читается: {exc}",
+        ) from exc
+    if not isinstance(data, dict):
+        log.warning("update: manifest не JSON-объект: %s", manifest_path)
+        raise HTTPException(
+            status_code=404,
+            detail="manifest.json повреждён: ожидался JSON-объект",
+        )
+    # Структура -- контракт build-apk.ps1: битые поля ломают и решение
+    # телефона об обновлении, и имя APK (поле file) -> 404, а не 500.
+    required: dict[str, type] = {
+        "version_code": int, "version_name": str, "file": str,
+        "size_bytes": int, "sha256": str, "released_at": str,
+    }
+    problems: list[str] = []
+    for key, typ in required.items():
+        value = data.get(key)
+        # Для int -- type(v) is int, а не isinstance: bool является
+        # подклассом int, и version_code: true проходил бы валидацию
+        # -> 200 с мусором и падение парсера на телефоне (QA #2).
+        ok = type(value) is int if typ is int else isinstance(value, typ)
+        if not ok:
+            problems.append(f"{key}: ожидалось {typ.__name__}")
+    if isinstance(data.get("file"), str) and not data["file"].strip():
+        problems.append("file: пустое имя файла")
+    # Проверки значений (типы уже отработали, guard против TypeError):
+    # size_bytes > 0 -- APK не бывает 0 байт (build-apk.ps1 копирует
+    # собранный файл), 0 в манифесте = битая публикация -> 404.
+    if type(data.get("size_bytes")) is int and data["size_bytes"] <= 0:
+        problems.append("size_bytes: должен быть > 0")
+    sha = data.get("sha256")
+    if isinstance(sha, str) and not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+        # hex в любом регистре (build-apk пишет lowercase) -- но ровно
+        # 64 символа: обрезанный/мусорный хеш сломал бы сверку на телефоне.
+        problems.append("sha256: ожидалось ровно 64 hex-символа")
+    if problems:
+        log.warning("update: manifest некорректен (%s): %s", manifest_path,
+                    "; ".join(problems))
+        raise HTTPException(
+            status_code=404,
+            detail="manifest.json некорректен: " + "; ".join(problems),
+        )
+    return data
+
+
+@app.get("/update/manifest")
+async def update_manifest() -> dict[str, Any]:
+    """Манифест релиза: телефон сверяет version_code и решает обновляться."""
+    return _load_update_manifest()
+
+
+@app.get("/update/apk")
+async def update_apk() -> FileResponse:
+    """Скачивание APK: имя файла берётся из поля `file` манифеста."""
+    manifest = _load_update_manifest()
+    name = str(manifest["file"])
+    # detail без путей сервера (QA #4) -- одно сообщение на оба 404-ветки.
+    apk_missing = (f"APK-файл {name!r} не найден: "
+                   "собери релиз через scripts/build-apk.ps1")
+    apk_dir = Path(settings.apk_dir).resolve()
+    apk_path = (apk_dir / name).resolve()
+    # `file` приходит с диска: не выходим за каталог релизов -- защита от
+    # "../..." даже если манифест кто-то подменил (отдаём только свой файл).
+    if apk_path.parent != apk_dir or not apk_path.is_file():
+        log.warning("update: APK не найден: %s", apk_path)
+        raise HTTPException(status_code=404, detail=apk_missing)
+    try:
+        # Один stat на всё (QA #1): между is_file() и отдачей файл может
+        # исчезнуть (build-apk.ps1 перезаписывает releases/ в момент
+        # скачивания) -> без этого FileNotFoundError = 500 вместо 404.
+        st = apk_path.stat()
+    except OSError:
+        log.warning("update: APK исчез между проверкой и отдачей: %s",
+                    apk_path)
+        raise HTTPException(status_code=404,
+                            detail=apk_missing) from None
+    # Сверка размера с манифестом (финальное ревью): build-apk.ps1
+    # перезаписывает APK на месте (Copy-Item -Force: десятки МБ копируются
+    # секунды/минуты) -- всё это время манифест старый, а файл уже обрезан
+    # или недописан; после прерванной сборки рассинхрон держится до
+    # следующего релиза. Телефон тогда качал бы десятки МБ и падал в
+    # ERROR -- даём внятный 404. sha256 на сервере НЕ считаем: хешировать
+    # файл на каждый запрос незачем, телефон сверит его сам после скачивания.
+    if st.st_size != manifest["size_bytes"]:
+        log.warning("update: APK %d байт != size_bytes %d в манифесте: %s",
+                    st.st_size, manifest["size_bytes"], apk_path)
+        raise HTTPException(
+            status_code=404,
+            detail="APK не соответствует манифесту — пересобери релиз "
+                   "через scripts/build-apk.ps1",
+        )
+    log.info("update: отдаём %s (%d байт)", apk_path.name, st.st_size)
+    # filename -> Content-Disposition: attachment; filename="app-debug.apk"
+    # (просто и достаточно: телефон сохраняет файл под своим именем).
+    # stat_result -- наш уже проверенный stat, starlette не делает повторный.
+    return FileResponse(
+        apk_path,
+        media_type="application/vnd.android.package-archive",
+        filename=apk_path.name,
+        stat_result=st,
+    )
 
 
 def main() -> None:

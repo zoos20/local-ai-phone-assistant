@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Пути FileProvider для обновления APK: скачанный файл лежит в
+  context.cacheDir/updates (см. Updater.download), отдаётся установщику
+  через content:// URI с FLAG_GRANT_READ_URI_PERMISSION.
+-->
+<paths>
+    <cache-path name="updates/" path="updates/" />
+</paths>

@@ -72,6 +72,7 @@ scripts/                скрипты запуска/настройки (PowerS
   ddns-update.ps1         обновление AAAA/A-записи ПК у dynv6 (задача каждые 5 мин)
   setup-ddns-task.ps1     разовый: регистрация задачи планировщика Gemma-DDNS
   gen-cert.py             самоподписанный сертификат туннеля (создаёт tunnel.py сам)
+  build-apk.ps1           релиз APK одной командой: сборка + releases/ с manifest.json
 server/                 Python-часть (здесь же .env, окружения, models/):
   server.py               FastAPI: точка входа, /ask /voice /ws_voice /tts /confirm...
   tunnel.py               туннель: wss://:8443/tunnel -> прокси на 8090 (доступ из интернета)
@@ -98,11 +99,12 @@ server/                 Python-часть (здесь же .env, окружен�
   tools.py                действия: поиск, Telegram, VK, звонки
   config.py               настройки из .env (префикс ASSISTANT_)
   login_tg.py             разовый вход в Telegram (Telethon user session)
-  tests/                  pytest: 111 тестов (endpointing, decide, профили...)
+  tests/                  pytest: 137 тестов (endpointing, decide, обновление APK...)
   pyproject.toml          ruff + pytest-конфигурация
   requirements.txt        зависимости основного окружения
   requirements-dev.txt    dev-зависимости (pytest, ruff)
   .env.example            шаблон настроек
+releases/                 каталог релизов APK (app-debug.apk + manifest.json, не в git)
 models/                 голоса Piper (*.onnx) внутри server/ — не в репозитории
 ```
 
@@ -116,13 +118,22 @@ Python-модули лежат плоско внутри `server/` (плоски
 
 ```powershell
 # Python (в server/, нужен dev-окружение: pip install -r requirements-dev.txt)
-.venv\Scripts\python.exe -m pytest -q      # 111 тестов
+.venv\Scripts\python.exe -m pytest -q      # 137 тестов
 .venv\Scripts\python.exe -m ruff check .   # линтер
 
 # Android (в android/)
-.\gradlew.bat testDebugUnitTest            # 77 юнит-тестов
+.\gradlew.bat testDebugUnitTest            # 122 юнит-теста
 .\gradlew.bat assembleDebug
 ```
+
+Релиз APK для беспроводного обновления собирается одной командой из корня
+проекта (нужен заданный `JAVA_HOME`, JDK 17):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-apk.ps1
+```
+
+Подробности — раздел «Обновление приложения».
 
 ## Требования
 
@@ -207,6 +218,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-firewall.ps1   # 8090 (LA
 | `ASSISTANT_TUNNEL_CERT` / `ASSISTANT_TUNNEL_KEY` | пути к самоподписанному сертификату (создаётся сам) |
 | `ASSISTANT_DDNS_HOSTNAME` | DDNS-имя ПК, напр. `mypc.dynv6.net` (записи туннеля) |
 | `ASSISTANT_DDNS_TOKEN` | токен https://dynv6.com (API) для `ddns-update.ps1` |
+| `ASSISTANT_APK_DIR` | каталог релизов APK для `/update/*` (по умолчанию `<корень>/releases`) |
 
 Telegram и VK работают **необязательно**: при пустых токенах команды отправки
 отвечают отказом, всё остальное функционирует.
@@ -235,6 +247,8 @@ cd server
 | POST | `/confirm` | `{"token":"...","yes":true\|false}` | `{"reply","ok"}` |
 | GET | `/profile` | — | текущий профиль, голос, список доступных |
 | POST | `/profile` | `{"profile":"tsundere"}` | переключение профиля |
+| GET | `/update/manifest` | — | манифест релиза APK: `{"version_code","version_name","file","size_bytes","sha256","released_at"}` |
+| GET | `/update/apk` | — | скачивание APK (`application/vnd.android.package-archive`), имя из поля `file` манифеста |
 
 `action`: `search` | `send_tg` | `send_vk` | `call` | `none`.
 Отправка сообщений и звонки выполняются **только** после `/confirm` с
@@ -302,6 +316,68 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
 Адрес сервера вводится на экране «Настройки» (шестерёнка в шапке; по
 умолчанию подсказка `http://192.168.1.100:8090` — замените на IP вашего ПК).
+
+## Обновление приложения
+
+Телефон забирает новую сборку с домашнего ПК **по LAN** — без провода и adb:
+скрипт кладёт APK в каталог релизов, а приложение само проверяет наличие
+новой версии, скачивает файл (сверяет размер и SHA-256) и запускает
+системный установщик.
+
+**Требования:**
+
+- на ПК запущен `server.py`, и телефон видит его в той же сети;
+- `ASSISTANT_API_TOKEN` одинаковый в `.env` и в настройках приложения —
+  оба запроса идут под заголовком `X-Gemma-Token`;
+- собранная сборка лежит в `releases/` (заполняет `scripts/build-apk.ps1`:
+  `app-debug.apk` + `manifest.json` с версией, размером и sha256);
+- обновление идёт **только по прямому LAN-адресу** сервера — через туннель
+  не работает: `Updater` делает обычный HTTP-запрос и канал туннеля
+  не поднимает. Вне дома (8090 напрямую недоступен) обновиться нельзя —
+  это ограничение схемы, а не поломка.
+
+**Регламент релиза** (повторяемо с нуля):
+
+```powershell
+# 1. Поднять версию в android/app/build.gradle.kts (versionCode +1, versionName)
+# 2. Собрать и опубликовать:
+powershell -ExecutionPolicy Bypass -File scripts\build-apk.ps1
+# 3. Перезапускать server.py не нужно — эндпоинты читают каталог при каждом запросе
+# 4. На телефоне: Настройки → Обновление → «Проверить обновление» → «Скачать и установить»
+```
+
+На шаге 4 карточка «Обновление» (экран «Настройки») показывает подпись
+текущей версии, дальше ведёт по состояниям: «Проверить обновление» →
+«Доступна версия X (код N)» → «Скачать и установить» (прогресс, потом сверка
+размера и sha256) → «Установить» — открывается системный установщик Android.
+
+**Ограничения:**
+
+- сборка **debug** и подписана debug-ключом: поверх установленной сборки
+  Android ставит только APK с тем же ключом подписи — если телефон и ПК
+  собираются разными debug-ключами, установка поверх откажется;
+- APK ~69 МБ — внутрь встроена голосовая модель Vosk;
+- каталог `releases/` не попадает в git — это локальные артефакты ПК;
+- обновление работает только по LAN (см. выше), через туннель — нет;
+- `versionCode` обязан расти: приложение сравнивает `version_code` манифеста
+  со своим и отклоняет сборку с кодом ≤ текущего («Установлена последняя
+  версия»).
+
+**Проверка после релиза** — манифест отдаёт новый код версии:
+
+```powershell
+# curl.exe, а не curl: в PowerShell 5.1 curl — алиас Invoke-WebRequest без -H
+curl.exe -H "X-Gemma-Token: <ASSISTANT_API_TOKEN>" http://127.0.0.1:8090/update/manifest
+# {"version_code": 2, "version_name": "0.2", "file": "app-debug.apk",
+#  "size_bytes": 68801417, "sha256": "...", "released_at": "..."}
+```
+
+Пример приведён после подъёма версии — фактические значения всегда в
+`releases/manifest.json`.
+
+Пустой `ASSISTANT_API_TOKEN` — заголовок не нужен (LAN-only режим). При
+заданном токене: без заголовка — 401; без `releases/manifest.json` — 404
+с подсказкой «собери релиз через scripts/build-apk.ps1».
 
 ## Доступ из интернета (гибридный туннель)
 

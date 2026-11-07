@@ -2,13 +2,25 @@
 <!-- Гемма — экран настроек подключения. Стиль главного экрана: лавандовый
      фон, стеклянная карточка, поля ввода с тем же bg_input.
      Сюда вынесена верхняя карточка с главного экрана: адрес сервера (IP),
-     домен туннеля (DDNS), токен API и пин сертификата. -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     домен туннеля (DDNS), токен API и пин сертификата.
+     Экран завёрнут в ScrollView (fillViewport): на бюджетных 720p
+     (~640-700dp высоты) контент ~750dp обрезался бы, а статусы tvCheck
+     («Скачиваю… N%», ошибки) должны быть достижимы прокруткой.
+     focusable/focusableInTouchMode на внутреннем layout — классический
+     фикс авто-скролла ScrollView к первому EditText при старте. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/bg_app"
-    android:orientation="vertical"
+    android:fillViewport="true"
     android:padding="24dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:orientation="vertical">
 
     <!-- Шапка: стрелка-назад + заголовок (как у главного экрана) -->
     <LinearLayout
@@ -152,6 +164,55 @@
         android:text="Сохранить"
         android:textSize="15sp" />
 
+    <!-- Обновление APK (Updater): подпись версии, кнопка, прогресс;
+         статусы состояний идут в общую строку tvCheck внизу экрана -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/bg_card"
+        android:elevation="6dp"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Обновление"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tvVersion"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp" />
+
+        <Button
+            android:id="@+id/btnUpdate"
+            style="@style/Widget.Gemma.Button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_button_gradient"
+            android:backgroundTint="@null"
+            android:text="Проверить обновление"
+            android:textColor="@android:color/white"
+            android:textSize="15sp" />
+
+        <ProgressBar
+            android:id="@+id/progressUpdate"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:max="100"
+            android:progress="0"
+            android:visibility="gone" />
+    </LinearLayout>
+
     <View
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -166,4 +227,5 @@
         android:text="Заполните адрес сервера и нажмите «Сохранить»."
         android:textColor="@color/status_idle"
         android:textSize="14sp" />
-</LinearLayout>
+    </LinearLayout>
+</ScrollView>

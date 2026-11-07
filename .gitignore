@@ -18,6 +18,9 @@ models/
 data/
 stt_debug/
 
+# --- релизы APK (наполняет scripts/build-apk.ps1, отдаёт /update/*) ---
+releases/
+
 # --- android ---
 android/local.properties
 android/.gradle/

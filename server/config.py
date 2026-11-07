@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8090
 
+    # --- Обновление приложения по беспроводу (фича «wireless-update») ---
+    # Каталог с APK и releases/manifest.json: наполняет scripts/build-apk.ps1,
+    # отдаёт GET /update/manifest и GET /update/apk (оба под токеном).
+    # Путь относительный трактуется от корня проекта; по умолчанию <корень>/releases.
+    apk_dir: str = str(BASE_DIR / "releases")
+
     # --- Доступ из интернета (гибридный туннель, план «туннель») ---
     # Общий секрет: проверяется на ВСЕХ HTTP-эндпоинтах 8090 в заголовке
     # X-Gemma-Token (кроме /health и /cert) и при открытии канала туннеля.
@@ -90,6 +96,24 @@ class Settings(BaseSettings):
     def _empty_int(cls, v: object) -> object:
         # Пустая строка в .env (ASSISTANT_TG_API_ID=) -> "не задано".
         return 0 if v == "" else v
+
+    @field_validator("apk_dir", mode="before")
+    @classmethod
+    def _empty_apk_dir(cls, v: object) -> object:
+        # Пустая строка в .env (ASSISTANT_APK_DIR=) -> дефолт <корень>/releases:
+        # пустой каталог сломал бы /update/* (404 на всё) без видимой причины.
+        return str(BASE_DIR / "releases") if v == "" else v
+
+    @field_validator("apk_dir", mode="after")
+    @classmethod
+    def _resolve_apk_dir(cls, v: str) -> str:
+        # Относительный путь (ASSISTANT_APK_DIR=releases) трактуем от корня
+        # проекта, а не от рабочей каталога процесса: сервер может стартовать
+        # из любого места, а каталог релизов -- всегда один.
+        p = Path(v).expanduser()
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return str(p)
 
     @field_validator("api_token")
     @classmethod

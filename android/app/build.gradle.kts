@@ -44,4 +44,7 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Характеризационные юнит-тесты (распознавание, фонетика, RMS, wake)
     testImplementation("junit:junit:4.13.2")
+    // org.json в unit-тестах: android.jar замокан, нужна реальная реализация
+    // для Updater.parseManifest (штатный workaround)
+    testImplementation("org.json:json:20240303")
 }
