@@ -140,6 +140,32 @@
             android:textColor="@color/text_primary"
             android:textColorHint="@color/text_secondary"
             android:textSize="15sp" />
+
+        <!-- Логи на ПК: отдельный флаг (Settings.phone_logs), пишется сразу
+             при переключении; на 720p в ScrollView помещается — экран
+             прокручивается (fillViewport) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Логи на ПК"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchPhoneLogs"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Логи на ПК"
+                android:minHeight="48dp" />
+        </LinearLayout>
     </LinearLayout>
 
     <!-- Действия: проверка связи до сохранения и сохранение -->

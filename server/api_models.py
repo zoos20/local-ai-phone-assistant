@@ -49,3 +49,21 @@ class VoiceResponse(AskResponse):
 
 class TtsRequest(BaseModel):
     text: str = Field(min_length=1, max_length=3000)
+
+
+# --------------------------------------------------------------------------
+# Приёмник логов телефона (фича «беспроводной дебагинг», задача 3)
+# --------------------------------------------------------------------------
+class PhoneLogEntry(BaseModel):
+    """Одна запись лога с телефона (формат батча — план фичи, решение 1)."""
+
+    ts: int = 0                 # клиентская эпоха, мс; 0/нет -> время сервера
+    level: Literal["D", "I", "W", "E"]   # иначе -> 400 (не 500)
+    tag: str
+    msg: str
+
+
+class PhoneLogBatch(BaseModel):
+    # Пустой список и >200 записей -> ValidationError -> 400 в server.py
+    # (лимит 200 записей — решение плана по open question №1).
+    entries: list[PhoneLogEntry] = Field(min_length=1, max_length=200)

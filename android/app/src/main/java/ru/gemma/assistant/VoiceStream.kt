@@ -1,6 +1,5 @@
 package ru.gemma.assistant
 
-import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -89,13 +88,13 @@ class VoiceStream(
         if (t != null && t.isOpen()) {
             client = null
             ws = null
-            Log.i(TAG, "connect via tunnel")
+            AppLog.i(TAG, "connect via tunnel")
             voiceHandle = t.openVoice("/ws_voice", object : TunnelClient.VoiceCb {
                 override fun onText(text: String) {
                     try {
                         handle(JSONObject(text))
                     } catch (t2: Throwable) {
-                        Log.e(TAG, "bad message: $text", t2)
+                        AppLog.e(TAG, "bad message: $text", t2)
                     }
                 }
 
@@ -104,7 +103,7 @@ class VoiceStream(
                 }
 
                 override fun onClosed() {
-                    Log.i(TAG, "tunnel stream closed")
+                    AppLog.i(TAG, "tunnel stream closed")
                     ended = true
                     // reply мог дойти до обрыва -- не теряем его;
                     // без reply и без ошибки (чистое закрытие) иначе
@@ -128,7 +127,7 @@ class VoiceStream(
             val wsUrl = if (tok.isEmpty()) base
             else base + "?token=" + URLEncoder.encode(tok, "UTF-8")
             // URL в лог НЕ в полном виде: с токеном он утекает в logcat.
-            Log.i(TAG, "connect $base${if (tok.isEmpty()) "" else " (auth)"}")
+            AppLog.i(TAG, "connect $base${if (tok.isEmpty()) "" else " (auth)"}")
             val c = OkHttpClient.Builder()
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)   // long-poll живёт вечно
@@ -139,21 +138,21 @@ class VoiceStream(
                 Request.Builder().url(wsUrl).build(),
                 object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
-                        Log.i(TAG, "open")
+                        AppLog.i(TAG, "open")
                     }
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         try {
                             handle(JSONObject(text))
                         } catch (t2: Throwable) {
-                            Log.e(TAG, "bad message: $text", t2)
+                            AppLog.e(TAG, "bad message: $text", t2)
                         }
                     }
 
                     override fun onFailure(
                         webSocket: WebSocket, t2: Throwable, response: Response?,
                     ) {
-                        Log.e(TAG, "failed: ${t2.message}")
+                        AppLog.e(TAG, "failed: ${t2.message}")
                         failed = true
                         ended = true
                         // reply мог прийти до обрыва (до done) -- не теряем его
@@ -161,7 +160,7 @@ class VoiceStream(
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                        Log.i(TAG, "closed $code $reason")
+                        AppLog.i(TAG, "closed $code $reason")
                         ended = true
                         // чистое закрытие без reply: эмитим Failed,
                         // иначе SPEAKING залипнет навсегда (A2)
@@ -242,7 +241,7 @@ class VoiceStream(
             }
             "reply" -> pendReply = msg
             "done" -> flushReply()
-            else -> Log.i(TAG, "event: $msg")
+            else -> AppLog.i(TAG, "event: $msg")
         }
     }
 

@@ -2,7 +2,6 @@ package ru.gemma.assistant
 
 import android.os.SystemClock
 import android.util.Base64
-import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -118,7 +117,7 @@ object TunnelClient {
         pinRaw = p
         pinMismatch = false
         kick = true   // прервать backoff и попробовать с новым пином сразу
-        Log.i(TAG, "pin updated (next reconnect attempt uses it)")
+        AppLog.i(TAG, "pin updated (next reconnect attempt uses it)")
     }
 
     /** Слушатель смены состояния (вызывается из фоновых потоков!). */
@@ -222,14 +221,14 @@ object TunnelClient {
             try {
                 connectOnce()
             } catch (t: Throwable) {
-                Log.w(TAG, "connect failed: ${t.message}")
+                AppLog.w(TAG, "connect failed: ${t.message}")
             }
             // ошибка токена/аутентификации -- повтор не поможет
             if (stopRequested || fatalAuth) break
             attempt++
             val backoff = minOf(1000L shl minOf(attempt, 5), BACKOFF_MAX_MS)
             setState(State.RECONNECTING)
-            Log.i(TAG, "reconnect in ${backoff}ms (attempt $attempt, " +
+            AppLog.i(TAG, "reconnect in ${backoff}ms (attempt $attempt, " +
                     "last error: $lastError)")
             val until = SystemClock.elapsedRealtime() + backoff
             while (!stopRequested && SystemClock.elapsedRealtime() < until) {
@@ -241,7 +240,7 @@ object TunnelClient {
         failAll("канал закрыт")
         setState(State.DISCONNECTED)
         loopRunning = false
-        Log.i(TAG, "connect loop stopped")
+        AppLog.i(TAG, "connect loop stopped")
     }
 
     /** Одна попытка: живёт, пока сокет не закроется/не упадёт. */
@@ -256,10 +255,10 @@ object TunnelClient {
             val (factory, tm) = pinnedSslFactory(pin)
             builder.sslSocketFactory(factory, tm)
         } else if (pinRaw.isNotEmpty()) {
-            Log.w(TAG, "pin has wrong format, connecting without pinning: " +
+            AppLog.w(TAG, "pin has wrong format, connecting without pinning: " +
                     "'$pinRaw'")
         } else {
-            Log.w(TAG, "no cert pin (GET /cert at home or enter manually)")
+            AppLog.w(TAG, "no cert pin (GET /cert at home or enter manually)")
         }
 
         val opened = CountDownLatch(1)
@@ -267,7 +266,7 @@ object TunnelClient {
         val closed = CountDownLatch(1)
         val http = builder.build()
         client = http
-        Log.i(TAG, "connect $url")
+        AppLog.i(TAG, "connect $url")
         val socket = http.newWebSocket(
             Request.Builder().url(url).build(),
             object : WebSocketListener() {
@@ -287,7 +286,7 @@ object TunnelClient {
                 ) {
                     lastError = response?.let { "HTTP ${it.code}" }
                         ?: (t.message ?: t.javaClass.simpleName)
-                    Log.w(TAG, "socket failure: $lastError")
+                    AppLog.w(TAG, "socket failure: $lastError")
                     opened.countDown()
                     closed.countDown()
                 }
@@ -295,7 +294,7 @@ object TunnelClient {
                 override fun onClosed(
                     webSocket: WebSocket, code: Int, reason: String,
                 ) {
-                    Log.i(TAG, "socket closed: $code $reason")
+                    AppLog.i(TAG, "socket closed: $code $reason")
                     opened.countDown()
                     closed.countDown()
                 }
@@ -305,7 +304,7 @@ object TunnelClient {
 
         // ждём результат аутентификации, затем -- жизнь сокета
         if (!opened.await(AUTH_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-            Log.w(TAG, "auth timeout -- closing")
+            AppLog.w(TAG, "auth timeout -- closing")
             lastError = "таймаут аутентификации"
             try {
                 socket.cancel()
@@ -326,18 +325,18 @@ object TunnelClient {
         val msg = try {
             JSONObject(text)
         } catch (_: Exception) {
-            Log.w(TAG, "bad frame: ${text.take(80)}")
+            AppLog.w(TAG, "bad frame: ${text.take(80)}")
             return
         }
         when (msg.optString("t")) {
             "ok" -> {
-                Log.i(TAG, "channel authenticated")
+                AppLog.i(TAG, "channel authenticated")
                 setState(State.CONNECTED)
                 opened.countDown()
             }
             "err" -> {
                 lastError = msg.optString("m", "ошибка канала")
-                Log.e(TAG, "channel error: $lastError")
+                AppLog.e(TAG, "channel error: $lastError")
                 fatalAuth = true
                 opened.countDown()
             }
@@ -369,7 +368,12 @@ object TunnelClient {
 
     private fun setState(s: State) {
         if (state == s) return
+        val from = state
         state = s
+        // Явные события канала логов (задача 7, FR-B2): открытие
+        // (… -> CONNECTED), закрытие (-> DISCONNECTED), реконнект —
+        // ровно одна запись на реальную смену состояния
+        AppLog.i(TAG, "state $from -> $s")
         listener?.invoke(s)
     }
 
@@ -495,7 +499,7 @@ object TunnelClient {
         try {
             ws?.send(obj.toString())
         } catch (e: Exception) {
-            Log.w(TAG, "send failed: ${e.message}")
+            AppLog.w(TAG, "send failed: ${e.message}")
         }
     }
 

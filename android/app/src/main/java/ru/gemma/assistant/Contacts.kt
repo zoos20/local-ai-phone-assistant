@@ -2,7 +2,6 @@ package ru.gemma.assistant
 
 import android.content.Context
 import android.provider.ContactsContract
-import android.util.Log
 
 private const val TAG = "GemmaService"
 
@@ -41,7 +40,7 @@ internal fun Context.findContacts(name: String): List<Pair<String, String>> {
             }
         }
     } catch (t: Throwable) {
-        Log.e(TAG, "contact query failed", t)
+        AppLog.e(TAG, "contact query failed", t)
     }
     return out
 }

@@ -19,7 +19,6 @@ import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import android.util.Log
 import kotlin.math.sin
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -271,14 +270,19 @@ class AssistantService : Service() {
      * Единая точка смены состояния стейт-машины ([SessionState.state]):
      * `from -> to`.
      *
-     * Побочных эффектов здесь НЕТ (осознанно): логи, сбросы,
+     * Побочных эффектов здесь НЕТ, кроме одной (осознанно, задача 7 фичи
+     * «Беспроводной дебагинг»): переход пишется в канал логов — это
+     * явное событие FR-B2, которого не было в logcat. Сбросы,
      * updateNotification, cue и guard'ы остаются на call-site вокруг
-     * вызова -- как и до рефакторинга. [from] -- исходное состояние
+     * вызова — как и до рефакторинга. [from] -- исходное состояние
      * call-site (для читаемости и отладки); запись `to` выполняется
      * всегда.
      */
     private fun transition(from: State, to: State) {
         session.state = to
+        // Тег ровно "AssistantService" — его ждёт проверка KA6 в
+        // logs/phone.log (TAG сервиса "GemmaService" -- другой)
+        AppLog.i("AssistantService", "transition $from -> $to")
     }
 
     private lateinit var server: String
@@ -313,13 +317,13 @@ class AssistantService : Service() {
     @Volatile private var btActive = false
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-            Log.i(TAG, "audio devices added: " +
+            AppLog.i(TAG, "audio devices added: " +
                     addedDevices.joinToString { "type=${it.type}" })
             applyBluetoothInput()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-            Log.i(TAG, "audio devices removed: " +
+            AppLog.i(TAG, "audio devices removed: " +
                     removedDevices.joinToString { "type=${it.type}" })
             applyBluetoothInput()
         }
@@ -382,13 +386,16 @@ class AssistantService : Service() {
         // Токен API живёт в Settings: при рестарте процесса системой
         // (START_STICKY) MainActivity может не быть -- подхватываем сами
         ServerClient.token = Settings.apiToken(this)
+        // Канал логов на ПК (задача 7): старт ПОСЛЕ токена -- гейт читает
+        // переключатель «Логи на ПК» и поднимает фоновую отправку
+        PhoneLogChannel.start(this)
         // BT-наушники: слушаем подключение/отключение и переключаем
         // микрофон (иначе ассистент через них не слышит)
         audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager
         try {
             audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
         } catch (t: Throwable) {
-            Log.w(TAG, "audio device callback failed", t)
+            AppLog.w(TAG, "audio device callback failed", t)
         }
     }
 
@@ -461,10 +468,16 @@ class AssistantService : Service() {
                 wakeRecognizer = null
                 voskModel = null
             } else {
-                Log.w(TAG, "audio thread alive after join(2000) -- " +
+                AppLog.w(TAG, "audio thread alive after join(2000) -- " +
                         "Vosk не закрываем (утечка до смерти процесса)")
             }
             scope.cancel()
+            // Канал логов (задача 7): слушатель prefs снимается, а СВОЯ
+            // корутина отправки гасится в PhoneLogChannel.stop()
+            // (flushJob.cancel()) -- scope.cancel() выше сервисный и к
+            // каналу отношения не имеет; буфер сохраняется,
+            // неотправленное уйдёт при следующем старте (FR-B5)
+            PhoneLogChannel.stop()
             super.onDestroy()
         } finally {
             // acquire() без таймаута (см. acquireWakeLock): release() обязателен
@@ -483,7 +496,7 @@ class AssistantService : Service() {
             val modelDir = File(filesDir, "vosk-model-small-ru-0.22")
             if (!modelDir.exists()) {
                 updateNotification("Модель не скачена — открой приложение")
-                Log.e(TAG, "model dir missing: $modelDir")
+                AppLog.e(TAG, "model dir missing: $modelDir")
                 stopSelf()
                 return
             }
@@ -496,7 +509,7 @@ class AssistantService : Service() {
                 setGrammar(WAKE_GRAMMAR)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "vosk init failed", t)
+            AppLog.e(TAG, "vosk init failed", t)
             updateNotification("Ошибка модели Vosk")
             stopSelf()
             return
@@ -514,7 +527,7 @@ class AssistantService : Service() {
                 maxOf(minBuf, SAMPLE_RATE) // >= 1 с запаса
             )
         } catch (t: Throwable) {
-            Log.e(TAG, "AudioRecord failed", t)
+            AppLog.e(TAG, "AudioRecord failed", t)
             updateNotification("Микрофон недоступен")
             stopSelf()
             return
@@ -532,22 +545,22 @@ class AssistantService : Service() {
             if (AcousticEchoCanceler.isAvailable()) {
                 AcousticEchoCanceler.create(record.audioSessionId)?.let {
                     it.enabled = true
-                    Log.i(TAG, "AEC enabled")
+                    AppLog.i(TAG, "AEC enabled")
                 }
             }
             if (NoiseSuppressor.isAvailable()) {
                 NoiseSuppressor.create(record.audioSessionId)?.let {
                     it.enabled = true
-                    Log.i(TAG, "NS enabled")
+                    AppLog.i(TAG, "NS enabled")
                 }
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "AEC/NS setup failed", t)
+            AppLog.w(TAG, "AEC/NS setup failed", t)
         }
 
         updateNotification("Слушаю «Гемма»…")
         record.startRecording()
-        Log.i(TAG, "audio loop started")
+        AppLog.i(TAG, "audio loop started")
 
         val frame = ByteArray(SAMPLE_RATE * 2 / 10) // 100 мс
         // кольцевой буфер последних WAKE_RING_MS мс звука: при срабатывании
@@ -624,13 +637,13 @@ class AssistantService : Service() {
             val now = System.currentTimeMillis()
             if (text.isNotBlank() && now - session.lastWakeLogMs > 700) {
                 session.lastWakeLogMs = now
-                Log.i(TAG, "wake-hear: '$text'")
+                AppLog.i(TAG, "wake-hear: '$text'")
             }
             // уровень фонового шума (калибровка порога SPEECH_RMS)
             val rms = pcmRms(frame, n)
             if (now - session.lastNoiseLogMs > 3000) {
                 session.lastNoiseLogMs = now
-                Log.i(TAG, "wake-rms=$rms")
+                AppLog.i(TAG, "wake-rms=$rms")
             }
             if (isWakeTrigger(text)) {
                 // ступень 2: энергия (отсекает очевидный шум).
@@ -641,7 +654,7 @@ class AssistantService : Service() {
                 // против 7 попаданий в логе 13:15-13:26).
                 val winRms = ringPeakRms(2000)
                 if (winRms < WAKE_MIN_RMS) {
-                    Log.i(
+                    AppLog.i(
                         TAG, "wake rejected: '$text' " +
                                 "winRms=$winRms cur=$rms (too quiet)"
                     )
@@ -658,7 +671,7 @@ class AssistantService : Service() {
             // heard ''), а новые удары кончаются -- раньше команда
             // вовсе не стартовала (логи 28.10 19:58:31/46, 20:05:58)
             if (session.verifyRetryDeadlineMs != 0L && now >= session.verifyRetryDeadlineMs) {
-                Log.i(TAG, "wake verify retry window over")
+                AppLog.i(TAG, "wake verify retry window over")
                 session.verifyRetryDeadlineMs = 0L
             }
             if (isWakeTrigger(text) || session.verifyRetryDeadlineMs != 0L) {
@@ -680,7 +693,7 @@ class AssistantService : Service() {
                         else snapshot.copyOfRange(vFrom, snapshot.size)
                     )
                 if (vResult == VerifyResult.MISMATCH) {
-                    Log.i(TAG,
+                    AppLog.i(TAG,
                         "wake verify short mismatch -- trying full window")
                     vBytes = VERIFY_TAIL_MS * SAMPLE_RATE * 2 / 1000
                     vFrom = maxOf(0, snapshot.size - vBytes)
@@ -698,7 +711,7 @@ class AssistantService : Service() {
                     // Проверяем полное окно; MISMATCH при пустом коротком
                     // хвосте НЕ отменяет окно повтора (слово может ещё
                     // не финализироваться: '' -> retry -> 'гемма').
-                    Log.i(TAG,
+                    AppLog.i(TAG,
                         "wake verify empty short -- trying full window")
                     vBytes = VERIFY_TAIL_MS * SAMPLE_RATE * 2 / 1000
                     vFrom = maxOf(0, snapshot.size - vBytes)
@@ -713,7 +726,7 @@ class AssistantService : Service() {
                     VerifyResult.MISMATCH -> {
                         // содержимое есть в ОБОИХ окнах, но это не
                         // «гемма» -- reject
-                        Log.i(TAG, "wake rejected (verify failed)")
+                        AppLog.i(TAG, "wake rejected (verify failed)")
                         session.verifyRetryDeadlineMs = 0L
                         try { wakeRecognizer?.reset() } catch (_: Exception) {}
                         return false
@@ -738,18 +751,18 @@ class AssistantService : Service() {
                         // отклоняется молча -- бип и запись не стартуют.
                         if (session.verifyRetryDeadlineMs == 0L) {
                             session.verifyRetryDeadlineMs = now + VERIFY_RETRY_MS
-                            Log.i(
+                            AppLog.i(
                                 TAG, "wake verify empty on fresh hit -- " +
                                         "retrying within ${VERIFY_RETRY_MS}ms"
                             )
                         } else {
-                            Log.i(TAG, "wake verify empty (retry)")
+                            AppLog.i(TAG, "wake verify empty (retry)")
                         }
                         return false
                     }
                     VerifyResult.MATCH -> { session.verifyRetryDeadlineMs = 0L }
                 }
-                Log.i(TAG, "wake word hit: '$text'")
+                AppLog.i(TAG, "wake word hit: '$text'")
                 try {
                     wakeRecognizer?.reset()
                     recognizer?.reset()
@@ -831,7 +844,7 @@ class AssistantService : Service() {
                 // word в STOP_WORDS не входят)
                 val stopHit = stopWordHit(heard)
                 if (stopHit != null) {
-                    Log.i(TAG, "stop word: '$stopHit' -- abort command")
+                    AppLog.i(TAG, "stop word: '$stopHit' -- abort command")
                     // стрим закрываем с abort: сервер молчит
                     // (end здесь НЕ шлём -- иначе ответит по мусору)
                     voiceStream?.abort()
@@ -850,7 +863,7 @@ class AssistantService : Service() {
             // -> закрываем запись СРАЗУ, не досчитывая локальные
             // QUIET_END_MS=3 с: это и есть выигрыш стриминга
             if (streamEndpoint) {
-                Log.i(TAG, "stream endpoint -- finish command " +
+                AppLog.i(TAG, "stream endpoint -- finish command " +
                         "(elapsed=$elapsed)")
                 enterSpeaking(viaStream = true)
                 return false
@@ -878,7 +891,7 @@ class AssistantService : Service() {
             }
 
             if (decision == "no-input") {
-                Log.i(
+                AppLog.i(
                     TAG, "no input in ${NO_INPUT_MS}ms " +
                             "(speech=${session.speechMsTotal}ms) -- back to wake"
                 )
@@ -892,7 +905,7 @@ class AssistantService : Service() {
                 updateNotification("Слушаю «Гемма»…")
             } else if (decision != null) {
                 val bytes = session.commandBuf.toByteArray()
-                Log.i(
+                AppLog.i(
                     TAG, "command captured: size=${bytes.size} " +
                             "elapsed=$elapsed peak=${pcmPeak(bytes)} " +
                             "rmsMax=${session.rmsMax} speech=${session.speechMsTotal}ms " +
@@ -921,7 +934,7 @@ class AssistantService : Service() {
                 System.currentTimeMillis() - session.speakDeadlineMs >
                 SPEAKING_TIMEOUT_MS
             ) {
-                Log.w(TAG, "SPEAKING timeout after " +
+                AppLog.w(TAG, "SPEAKING timeout after " +
                         "${SPEAKING_TIMEOUT_MS}ms -- abort")
                 session.speakDeadlineMs = 0
                 // гасим очередь чанков: игрок иначе держал бы
@@ -939,7 +952,7 @@ class AssistantService : Service() {
                 if (streamReply == null && !streamChunkSeen &&
                     wav != null
                 ) {
-                    Log.w(TAG, "SPEAKING timeout -- " +
+                    AppLog.w(TAG, "SPEAKING timeout -- " +
                             "fallback POST /voice")
                     scope.launch { processCommand(wav) }
                 } else {
@@ -983,7 +996,7 @@ class AssistantService : Service() {
                         nowB - session.lastSpeakHearLogMs > 800
                     ) {
                         session.lastSpeakHearLogMs = nowB
-                        Log.i(TAG, "speak-hear: '$heard'")
+                        AppLog.i(TAG, "speak-hear: '$heard'")
                     }
                     val words = heard.lowercase()
                         .replace(Regex("[^а-яёa-z ]"), " ")
@@ -991,7 +1004,7 @@ class AssistantService : Service() {
                         .filter { it.length >= 2 }
                     val hit = words.firstOrNull { it in STOP_WORDS }
                     if (hit != null) {
-                        Log.i(
+                        AppLog.i(
                             TAG, "stop word while speaking: " +
                                     "'$hit' -- interrupt reply"
                         )
@@ -1016,7 +1029,7 @@ class AssistantService : Service() {
                             session.bargeFrames = 0
                             // распознаватель НЕ сбрасываем: начало
                             // стоп-слова должно дожить до тишины
-                            Log.i(
+                            AppLog.i(
                                 TAG, "barge-in: voice (rms=" +
                                         "$rms base=${session.echoBase}) -- " +
                                         "pause playback"
@@ -1031,7 +1044,7 @@ class AssistantService : Service() {
                     // rms лог -- для настройки порогов.
                     if (nowB - session.lastPauseRmsLogMs > 400) {
                         session.lastPauseRmsLogMs = nowB
-                        Log.i(TAG, "pause rms=$rms base=${session.echoBase}")
+                        AppLog.i(TAG, "pause rms=$rms base=${session.echoBase}")
                     }
                     // тишина достаточно долго -- возобновляем озвучку
                     if (nowB - session.bargePauseMs >= 1200) {
@@ -1042,7 +1055,7 @@ class AssistantService : Service() {
                         // окно settle: триггер выключен, пока фон
                         // (быстро) догоняет уровень вернувшегося эха
                         session.bargeSettleUntil = nowB + 1200
-                        Log.i(
+                        AppLog.i(
                             TAG, "barge-in: silence -- resume " +
                                     "playback"
                         )
@@ -1068,7 +1081,7 @@ class AssistantService : Service() {
             if (rms >= SPEECH_RMS) session.confirmSpeechMs += 100
             if (!text.isNullOrBlank() && now - session.lastConfirmHearLogMs > 800) {
                 session.lastConfirmHearLogMs = now
-                Log.i(
+                AppLog.i(
                     TAG, "confirm-hear: '$text'" +
                             (if (isFinal) " (final)" else "") +
                             " speech=${session.confirmSpeechMs}ms"
@@ -1085,7 +1098,7 @@ class AssistantService : Service() {
                     session.confirmSpeechMs >= MIN_CONFIRM_SPEECH_MS
             when {
                 answer == true -> {
-                    Log.i(TAG, "confirm: yes ($text)")
+                    AppLog.i(TAG, "confirm: yes ($text)")
                     playCue(Cue.EXECUTE)   // «принято, выполняю»
                     transition(State.CONFIRM, State.SPEAKING)
                     updateNotification("Отправляю сообщение…")
@@ -1093,7 +1106,7 @@ class AssistantService : Service() {
                     scope.launch { doConfirm(token, true) }
                 }
                 answer == false -> {
-                    Log.i(TAG, "confirm: no ($text)")
+                    AppLog.i(TAG, "confirm: no ($text)")
                     playCue(Cue.CANCEL)    // «отмена»
                     transition(State.CONFIRM, State.SPEAKING)
                     updateNotification("Отменено")
@@ -1101,7 +1114,7 @@ class AssistantService : Service() {
                     scope.launch { doConfirm(token, false) }
                 }
                 otherSpeech -> {
-                    Log.i(TAG, "confirm: other speech -> no ($text)")
+                    AppLog.i(TAG, "confirm: other speech -> no ($text)")
                     playCue(Cue.CANCEL)
                     transition(State.CONFIRM, State.SPEAKING)
                     updateNotification("Отменено")
@@ -1109,7 +1122,7 @@ class AssistantService : Service() {
                     scope.launch { doConfirm(token, false) }
                 }
                 now > session.confirmDeadlineMs -> {
-                    Log.i(TAG, "confirm: timeout")
+                    AppLog.i(TAG, "confirm: timeout")
                     transition(State.CONFIRM, State.WAKE)
                     updateNotification("Слушаю «Гемма»…")
                 }
@@ -1142,7 +1155,7 @@ class AssistantService : Service() {
             // что в handleCommand: abort -> reset -> transition -> cue
             val stopHit = stopWordHit(heard)
             if (stopHit != null) {
-                Log.i(TAG, "stop word: '$stopHit' -- abort follow-up")
+                AppLog.i(TAG, "stop word: '$stopHit' -- abort follow-up")
                 voiceStream?.abort()
                 try {
                     recognizer?.reset()
@@ -1164,7 +1177,7 @@ class AssistantService : Service() {
                 session.followupSpeechMs >= FOLLOWUP_TRIG_MS -> {
                     // речь в окне: переходим в запись команды без
                     // wake word -- та же механика, что после «Геммы»
-                    Log.i(TAG, "follow-up: speech (rms=$rms) -- record command (depth $followupDepth)")
+                    AppLog.i(TAG, "follow-up: speech (rms=$rms) -- record command (depth $followupDepth)")
                     session.commandBuf.reset()
                     speechInterrupted = false
                     try {
@@ -1201,7 +1214,7 @@ class AssistantService : Service() {
                 // тишина до конца окна (речи не было вовсе) --
                 // обычное фоновое слушание
                 now >= followupDeadlineMs && !session.followupAnySpeech -> {
-                    Log.i(TAG, "follow-up: silence ${FOLLOWUP_START_MS}ms -- back to wake")
+                    AppLog.i(TAG, "follow-up: silence ${FOLLOWUP_START_MS}ms -- back to wake")
                     followupDepth = 0
                     transition(State.FOLLOWUP, State.WAKE)
                     updateNotification("Слушаю «Гемма»…")
@@ -1209,7 +1222,7 @@ class AssistantService : Service() {
                 // речь была, но не дошла до триггера (шум/обрыв) --
                 // держим окно ещё пару секунд и уходим
                 now >= followupDeadlineMs + 2000 -> {
-                    Log.i(TAG, "follow-up: speech attempt failed -- back to wake")
+                    AppLog.i(TAG, "follow-up: speech attempt failed -- back to wake")
                     followupDepth = 0
                     transition(State.FOLLOWUP, State.WAKE)
                     updateNotification("Слушаю «Гемма»…")
@@ -1248,7 +1261,7 @@ class AssistantService : Service() {
                     // свежий токен. На входе в CONFIRM -- всегда чисто:
                     // processCommand кладёт токен ДО смены состояния.
                     session.confirmToken = null
-                    Log.i(TAG, "confirm window: ${CONFIRM_MS} ms (direct, no wake)")
+                    AppLog.i(TAG, "confirm window: ${CONFIRM_MS} ms (direct, no wake)")
                 }
                 if (session.state == State.FOLLOWUP) {
                     // вход в окно дослушивания (открыл openFollowUp):
@@ -1295,7 +1308,7 @@ class AssistantService : Service() {
         }
         recorder = null
         record.release()
-        Log.i(TAG, "audio loop stopped")
+        AppLog.i(TAG, "audio loop stopped")
     }
 
     /**
@@ -1337,7 +1350,7 @@ class AssistantService : Service() {
             }
             rec.reset()
             val heard = (finals.toString() + partial).trim()
-            Log.i(TAG, "wake verify heard: '$heard'")
+            AppLog.i(TAG, "wake verify heard: '$heard'")
             if (heard.isBlank()) return VerifyResult.EMPTY
             val words = heard.lowercase()
                 .replace(Regex("[^а-яёa-z ]"), " ")
@@ -1358,7 +1371,7 @@ class AssistantService : Service() {
                 VerifyResult.MISMATCH
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "wake verify error", t)
+            AppLog.e(TAG, "wake verify error", t)
             VerifyResult.EMPTY
         }
     }
@@ -1404,7 +1417,7 @@ class AssistantService : Service() {
         val am = audioManager ?: return
         try {
             val all = am.getDevices(AudioManager.GET_DEVICES_ALL)
-            Log.i(TAG, "audio devices: " + all.joinToString {
+            AppLog.i(TAG, "audio devices: " + all.joinToString {
                 "type=${it.type}(${if (it.isSource) "in" else "out"})"
             })
             // BT-наушники: типы SCO/HFP и BLE (гарнитура/наушники с микрофоном)
@@ -1427,7 +1440,7 @@ class AssistantService : Service() {
                         @Suppress("DEPRECATION")
                         am.stopBluetoothSco()
                     }
-                    Log.i(TAG, "BT audio: disconnected -- built-in mic")
+                    AppLog.i(TAG, "BT audio: disconnected -- built-in mic")
                 }
                 return
             }
@@ -1436,12 +1449,12 @@ class AssistantService : Service() {
             if (Build.VERSION.SDK_INT >= 31) {
                 if (btOut != null) {
                     val ok = am.setCommunicationDevice(btOut)
-                    Log.i(TAG, "BT audio: setCommunicationDevice(type=${btOut.type}) -> $ok")
+                    AppLog.i(TAG, "BT audio: setCommunicationDevice(type=${btOut.type}) -> $ok")
                 }
             } else {
                 @Suppress("DEPRECATION")
                 am.startBluetoothSco()
-                Log.i(TAG, "BT audio: startBluetoothSco() (legacy)")
+                AppLog.i(TAG, "BT audio: startBluetoothSco() (legacy)")
             }
             btActive = true
             // привязываем запись к BT-микрофону (если вход уже виден)
@@ -1449,15 +1462,15 @@ class AssistantService : Service() {
                 val rec = recorder
                 if (rec != null) {
                     val ok = rec.setPreferredDevice(btIn)
-                    Log.i(TAG, "BT audio: AudioRecord preferred -> " +
+                    AppLog.i(TAG, "BT audio: AudioRecord preferred -> " +
                             "type=${btIn.type} ok=$ok")
                 }
             } else {
-                Log.i(TAG, "BT audio: output only, input not visible yet " +
+                AppLog.i(TAG, "BT audio: output only, input not visible yet " +
                         "-- will retry on device callback")
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "applyBluetoothInput failed", t)
+            AppLog.w(TAG, "applyBluetoothInput failed", t)
         }
     }
 
@@ -1475,7 +1488,7 @@ class AssistantService : Service() {
      * Озвучка ответа (MediaPlayer) уже идёт мимо системного потока.
      */
     private fun playCue(cue: Cue) {
-        Log.i(TAG, "cue: $cue")   // диагностика «много бипов» (живой тест 30.10)
+        AppLog.i(TAG, "cue: $cue")   // диагностика «много бипов» (живой тест 30.10)
         // пары (частота_Гц, длительность_мс); частота 0 = пауза
         val tone: IntArray = when (cue) {
             Cue.LISTEN_START -> intArrayOf(600, 140)
@@ -1552,7 +1565,7 @@ class AssistantService : Service() {
                 } catch (_: Exception) {
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "cue play failed: $cue", t)
+                AppLog.e(TAG, "cue play failed: $cue", t)
             }
         }.start()
     }
@@ -1587,15 +1600,15 @@ class AssistantService : Service() {
         voiceStream = VoiceStream(server, tunnel) { ev ->
             when (ev) {
                 is VoiceStream.Event.Ready ->
-                    Log.i(TAG, "stream ready")
+                    AppLog.i(TAG, "stream ready")
                 is VoiceStream.Event.Endpoint -> {
-                    Log.i(TAG, "stream endpoint -- closing capture")
+                    AppLog.i(TAG, "stream endpoint -- closing capture")
                     streamEndpoint = true
                 }
                 is VoiceStream.Event.Hear ->
-                    Log.i(TAG, "stream hear: '${ev.text}'")
+                    AppLog.i(TAG, "stream hear: '${ev.text}'")
                 is VoiceStream.Event.Sentence ->
-                    Log.i(TAG, "stream sentence: '${ev.text}'")
+                    AppLog.i(TAG, "stream sentence: '${ev.text}'")
                 is VoiceStream.Event.AudioChunk -> {
                     // стриминговая озвучка (фаза 6): чанк -> в очередь,
                     // игрок играет по мере готовности (первый звук ~1-1.5 с)
@@ -1635,12 +1648,12 @@ class AssistantService : Service() {
                     if (session.state == State.SPEAKING && streamReply == null &&
                         !streamChunkSeen
                     ) {
-                        Log.w(TAG, "stream died before reply -- " +
+                        AppLog.w(TAG, "stream died before reply -- " +
                                 "fallback POST /voice")
                         val wav = pendingWav
                         if (wav != null) scope.launch { processCommand(wav) }
                     } else {
-                        Log.w(TAG, "stream failed -- fallback по локальному decision")
+                        AppLog.w(TAG, "stream failed -- fallback по локальному decision")
                     }
                 }
             }
@@ -1670,7 +1683,7 @@ class AssistantService : Service() {
         // единственным слушающим состоянием молча -- непонятно, что
         // Гемма ждёт ответ без «Геммы»
         playCue(Cue.FOLLOWUP_WAIT)
-        Log.i(TAG, "follow-up window $followupDepth/$MAX_FOLLOWUP " +
+        AppLog.i(TAG, "follow-up window $followupDepth/$MAX_FOLLOWUP " +
                 "(${FOLLOWUP_START_MS}ms) after $reason")
     }
 
@@ -1685,7 +1698,7 @@ class AssistantService : Service() {
         try {
             val reply = streamReply?.ifBlank { null } ?: "Готово"
             val audio = streamAudio
-            Log.i(TAG, "stream reply: $reply (confirm=$streamConfirm " +
+            AppLog.i(TAG, "stream reply: $reply (confirm=$streamConfirm " +
                     "streamed=$streamStreamed)")
             if (streamStreamed) {
                 // чанки уже играли/играют (фаза 6) -- повторно НЕ
@@ -1702,7 +1715,7 @@ class AssistantService : Service() {
             }
 
             if (speechInterrupted) {
-                Log.i(TAG, "reply interrupted by stop word -- back to wake")
+                AppLog.i(TAG, "reply interrupted by stop word -- back to wake")
                 speechInterrupted = false
                 needReset = true
                 transition(State.SPEAKING, State.WAKE)
@@ -1727,7 +1740,7 @@ class AssistantService : Service() {
             // сервиса). Обрывы сети сюда не приходят (они ниже, общий catch).
             throw e
         } catch (t: Throwable) {
-            Log.e(TAG, "stream reply failed", t)
+            AppLog.e(TAG, "stream reply failed", t)
             speak("Не получилось связаться с сервером.")
             speechInterrupted = false
             needReset = true
@@ -1753,13 +1766,13 @@ class AssistantService : Service() {
             val needsConfirm = resp.optBoolean("needs_confirm")
             val token = resp.optString("token").ifBlank { null }
 
-            Log.i(TAG, "reply: $reply (confirm=$needsConfirm)")
+            AppLog.i(TAG, "reply: $reply (confirm=$needsConfirm)")
             speak(reply)
 
             // стоп-слово прервало озвучку -> НЕ ждём подтверждения,
             // просто возвращаемся в фоновое слушание
             if (speechInterrupted) {
-                Log.i(TAG, "reply interrupted by stop word -- back to wake")
+                AppLog.i(TAG, "reply interrupted by stop word -- back to wake")
                 speechInterrupted = false
                 needReset = true
                 transition(State.SPEAKING, State.WAKE)
@@ -1784,7 +1797,7 @@ class AssistantService : Service() {
             // (IOException) идёт в общий catch ниже: лог + фолбэк-озвучка
             throw e
         } catch (t: Throwable) {
-            Log.e(TAG, "command failed", t)
+            AppLog.e(TAG, "command failed", t)
             speak("Не получилось связаться с сервером.")
             speechInterrupted = false
             needReset = true
@@ -1804,7 +1817,7 @@ class AssistantService : Service() {
                 // в TTS (если он сырые цифры/ссылки -- виноват фолбэк
                 // summarize_search, а не Piper)
                 val reply = resp.optString("reply")
-                Log.i(TAG, "confirm reply (tts text): '$reply'")
+                AppLog.i(TAG, "confirm reply (tts text): '$reply'")
                 if (yes && resp.optString("action") == "call") {
                     callContact = resp.optJSONObject("args")
                         ?.optString("contact").orEmpty()
@@ -1818,7 +1831,7 @@ class AssistantService : Service() {
             // (IOException) идёт в общий catch ниже: лог + «Ошибка отправки.»
             throw e
         } catch (t: Throwable) {
-            Log.e(TAG, "confirm failed", t)
+            AppLog.e(TAG, "confirm failed", t)
             speak("Ошибка отправки.")
             callContact = null
         }
@@ -1837,7 +1850,7 @@ class AssistantService : Service() {
             return
         }
         if (interrupted) {
-            Log.i(TAG, "confirm reply interrupted by stop word -- back to wake")
+            AppLog.i(TAG, "confirm reply interrupted by stop word -- back to wake")
             followupDepth = 0
             transition(State.SPEAKING, State.WAKE)
             updateNotification("Слушаю «Гемма»…")
@@ -1880,12 +1893,12 @@ class AssistantService : Service() {
             }
         }
         try {
-            Log.i(TAG, "place call: '$target' -> $number")
+            AppLog.i(TAG, "place call: '$target' -> $number")
             val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(intent)
         } catch (t: Throwable) {
-            Log.e(TAG, "dial failed", t)
+            AppLog.e(TAG, "dial failed", t)
             speak("Не получилось позвонить: нет разрешения или недоступно.")
         }
     }
@@ -1951,7 +1964,7 @@ class AssistantService : Service() {
                         chunkQueue.clear()
                         chunkLock.notifyAll()
                     }
-                    Log.i(TAG, "chunk player done")
+                    AppLog.i(TAG, "chunk player done")
                 }
             }
         }
@@ -2022,7 +2035,7 @@ class AssistantService : Service() {
                 }
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "$tag failed", t)
+            AppLog.e(TAG, "$tag failed", t)
             latch.countDown()
         } finally {
             speakLatch = null
@@ -2034,7 +2047,7 @@ class AssistantService : Service() {
                     player?.stop()
                 } catch (_: Exception) {
                 }
-                Log.i(TAG, "$tag interrupted by stop word")
+                AppLog.i(TAG, "$tag interrupted by stop word")
             }
             try {
                 player?.release()
@@ -2054,7 +2067,7 @@ class AssistantService : Service() {
             val wav = if (preWav != null && preWav.isNotEmpty()) preWav
                       else ServerClient.tts(server, text)
             if (wav.isEmpty()) {
-                Log.w(TAG, "tts: empty wav for '$text'")
+                AppLog.w(TAG, "tts: empty wav for '$text'")
                 return@playWavLocked null
             }
             if (speechInterrupted) return@playWavLocked null  // стоп-слово во время запроса TTS

@@ -22,6 +22,14 @@ object ServerClient {
 
     private const val CONNECT_TIMEOUT = 10_000
     private const val READ_TIMEOUT = 120_000 // поиск + LLM могут быть долгими
+    private const val TAG = "ServerClient"
+
+    /**
+     * Последний выбранный транспорт — чтобы в канал логов писать только
+     * РЕАЛЬНУЮ смену LAN <-> туннель (FR-B2), а не каждый вызов API.
+     */
+    @Volatile
+    private var lastTransport: String? = null
 
     /** Токен API; задаётся MainActivity до любых запросов. */
     @Volatile
@@ -87,8 +95,22 @@ object ServerClient {
     }
 
     /** Выбор транспорта: канал подключён -> туннель, иначе -- LAN. */
-    private fun transportFor(server: String): Transport =
-        if (TunnelClient.isOpen()) TunnelTransport() else DirectTransport(server)
+    private fun transportFor(server: String): Transport {
+        val tunnel = TunnelClient.isOpen()
+        noteTransport(if (tunnel) "tunnel" else "lan")
+        return if (tunnel) TunnelTransport() else DirectTransport(server)
+    }
+
+    /**
+     * Смена транспорта LAN <-> туннель (задача 7, FR-B2): явное событие
+     * для канала логов с тегом `ServerClient`. Логируется только
+     * переключение, не каждый вызов [transportFor].
+     */
+    private fun noteTransport(name: String) {
+        if (lastTransport == name) return
+        lastTransport = name
+        AppLog.i(TAG, "transport -> $name")
+    }
 
     private fun authHeaders(): Map<String, String> =
         if (token.isEmpty()) emptyMap() else mapOf("X-Gemma-Token" to token)

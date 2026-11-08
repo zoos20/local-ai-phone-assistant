@@ -12,6 +12,7 @@
     POST /confirm         — {"token": "...", "yes": true|false} -> выполнить/отменить
     GET  /update/manifest — manifest.json релиза APK (обновление по воздуху)
     GET  /update/apk      — скачивание APK (телефон ставит обновление)
+    POST /debug/log       — батч логов телефона {"entries":[...]} -> logs/phone.log
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,8 @@ from api_models import (
     AskResponse,
     ConfirmRequest,
     ConfirmResponse,
+    PhoneLogBatch,
+    PhoneLogEntry,
     ProfileSetRequest,
     TtsRequest,
     VoiceResponse,
@@ -62,6 +66,44 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("assistant")
+
+# --- Канал логов телефона (фича «беспроводной дебагинг», задача 2) ---
+# Отдельный ротированный файл logs/phone.log (5 МБ x 3 бэкапа) --
+# консистентно с server.log; каталог logs/ создаётся при старте.
+# Логгер "phone" с propagate=False: записи приёмника (POST /debug/log,
+# задача 3) идут ТОЛЬКО в свой файл и не уходят через общий root-логгер
+# в server.log/консоль -- секреты через общий root не пишем.
+_PHONE_LOG_PATH = Path(__file__).with_name("logs") / "phone.log"
+_PHONE_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _setup_phone_log(path: Path | None = None) -> logging.Logger:
+    """Ротированный лог телефона; path переопределяет файл (для тестов).
+
+    Тесты (задача 4) вызывают `server._setup_phone_log(tmp_path / "phone.log")`:
+    каталог создаётся, прежние хендлеры снимаются -- дубликатов не остаётся.
+    """
+    target = _PHONE_LOG_PATH if path is None else Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    phone_logger = logging.getLogger("phone")
+    for old in list(phone_logger.handlers):
+        phone_logger.removeHandler(old)
+        old.close()
+    handler = RotatingFileHandler(
+        target, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(_PHONE_LOG_FORMAT))
+    phone_logger.setLevel(logging.INFO)
+    phone_logger.addHandler(handler)
+    phone_logger.propagate = False
+    return phone_logger
+
+
+# Побочный эффект импорта (принят критерием задачи 2): `phone_log =
+# _setup_phone_log()` создаёт logs/phone.log уже на импорте server.py,
+# а не при первом запросе. Атрибут модуля -- точка записи для приёмника
+# (POST /debug/log) и точка переопределения файла для тестов (задача 4).
+phone_log = _setup_phone_log()
 
 
 # Keep-alive llama (фаза 6): первый запрос после простоя >3 мин отвечает
@@ -379,6 +421,180 @@ async def cert_fingerprint() -> dict[str, Any]:
     # file -- только basename: полный путь серверной файловой системы
     # наружу (на телефон) не отдаём, ключи ответа не меняем.
     return {"fingerprint_sha256": hexs, "pin": pin, "file": cert_path.name}
+
+
+# --------------------------------------------------------------------------
+# Приёмник логов телефона (фича «беспроводной дебагинг», задача 3):
+# POST /debug/log принимает JSON-батч и пишет строки в logs/phone.log
+# (ротированный файл из задачи 2, атрибут модуля phone_log).
+#
+# Эндпоинт ПОД мидлварем require_api_token: в _TOKEN_EXEMPT его НЕ
+# добавляем — без X-Gemma-Token -> 401 (план фичи, запрет №5).
+# В phone.log пишется ТОЛЬКО содержимое принятого батча: логгер "phone"
+# (propagate=False из задачи 2) не ходит в общий server.log/консоль,
+# никакие секреты/диагностика сюда не попадают (FR-B7).
+# --------------------------------------------------------------------------
+# Лимит тела запроса — явный, 256 КБ (решение плана по open question №1).
+# Проверяется ДО накопления тела: по Content-Length до чтения и по
+# нарастающему счётчику при потоковом чтении — иначе битый/огромный
+# запрос переполнял бы память/диск (вектор риска из §6 спеки).
+_DEBUG_LOG_MAX_BYTES = 256 * 1024
+# Общий detail для обоих путей 413 (по Content-Length и при потоковом
+# чтении): текст идентичен, его же проверяют тесты приёмника.
+_DEBUG_LOG_TOO_LARGE = (f"тело запроса больше лимита "
+                        f"{_DEBUG_LOG_MAX_BYTES // 1024} КБ")
+
+# Ограничения строк ВЫВОДА (обрезка, не 400 — см. _format_phone_log_line).
+_PHONE_LOG_MSG_MAX = 4096      # logcat сам обрезает сообщение ~4 КБ
+_PHONE_LOG_TAG_MAX = 100
+_PHONE_LOG_NEWLINES_RE = re.compile(r"[\r\n]+")
+# Управляющие символы C0 (без tab \x09) и C1 + Unicode-разделители строк:
+# ANSI-эскейпы (\x1b…) перекрашивали бы консоль оператора в
+# `Get-Content -Wait`, а \x00/\u0085/\u2028/\u2029 ломали бы
+# splitlines-инструменты (вторая «запись» из одной строки).
+# \x0a/\x0d схлопываются предыдущим шагом (_PHONE_LOG_NEWLINES_RE).
+_PHONE_LOG_CONTROLS_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f\u0080-\u009f\u2028\u2029]"
+)
+# Formatter записей эндпоинта: в файле -- РОВНО строка `[ts] LEVEL/tag: msg`
+# (спека фичи, решение плана п.5). Дефолтный formatter хендлера из задачи 2
+# (`asctime INFO phone: ...`, как у server.log) добавил бы серверный
+# префикс и сломал критерий формата (задачи 4/10).
+_PHONE_LOG_LINE_FORMAT = "%(message)s"
+
+
+def _format_phone_log_line(entry: PhoneLogEntry) -> str:
+    """Строка файла: `[<ts ISO-8601>] <LEVEL>/<tag>: <msg>` (план, решение 5).
+
+    ts — клиентская эпоха в мс; 0/отсутствует/непредставима -> время сервера.
+    Переводы строк и управляющие символы (C0/C1, ANSI-эскейпы) в tag/msg
+    схлопываются в пробелы (одна запись = одна строка файла, иначе ломается
+    tail/фильтрация, а \x1b перекрашивал бы консоль оператора), длинные
+    строки ОБРЕЗАЮТСЯ, а не отклоняются: один гигантский лог не должен
+    ронять весь батч — канал логов обязан доставлять (обрезка = поведение
+    logcat; 400 оставлен для структурных ошибок: битые типы, уровень не
+    D|I|W|E, пустой/слишком большой entries — это баг клиента, его ловят
+    тесты).
+    """
+    if entry.ts > 0:
+        try:
+            # OverflowError/OSError/ValueError: непредставимая эпоха
+            # (год вне диапазона datetime) -> не 500, а время сервера.
+            when = datetime.fromtimestamp(entry.ts / 1000)
+        except (OverflowError, OSError, ValueError):
+            when = datetime.now()
+    else:
+        when = datetime.now()
+    # Сначала переводы строк (схлопывание группы в один пробел), затем
+    # управляющие символы (tab \x09 при этом сохраняется).
+    tag = _PHONE_LOG_NEWLINES_RE.sub(" ", entry.tag)
+    tag = _PHONE_LOG_CONTROLS_RE.sub(" ", tag)[:_PHONE_LOG_TAG_MAX]
+    msg = _PHONE_LOG_NEWLINES_RE.sub(" ", entry.msg)
+    msg = _PHONE_LOG_CONTROLS_RE.sub(" ", msg)[:_PHONE_LOG_MSG_MAX]
+    return (f"[{when.isoformat(timespec='milliseconds')}] "
+            f"{entry.level}/{tag}: {msg}")
+
+
+def _write_phone_log_batch(entries: list[PhoneLogEntry]) -> int:
+    """Пишет батч в logs/phone.log готовыми строками эндпоинта.
+
+    В файле обязана быть РОВНО строка `[<ts ISO-8601>] <LEVEL>/<tag>: <msg>`
+    (спека фичи, решение плана п.5): на время записи formatter хендлера
+    точечно сводится к `%(message)s` и в finally возвращается обратно --
+    серверный префикс `asctime INFO phone:` (формат задачи 2, «как у
+    server.log») в записях эндпоинта не добавляется, а сам формат задачи 2
+    и её точка переопределения `_setup_phone_log` остаются нетронутыми.
+    Запись батча синхронна (нет await внутри) -- переключение formatter'а
+    атомарно в рамках event loop, других писателей в логгер "phone" нет.
+    """
+    handler = phone_log.handlers[0] if phone_log.handlers else None
+    old_formatter = handler.formatter if handler is not None else None
+    if handler is not None:
+        handler.setFormatter(logging.Formatter(_PHONE_LOG_LINE_FORMAT))
+    try:
+        for entry in entries:
+            # "%s": строка с любым содержимым не уходит в %-формат логгера.
+            phone_log.info("%s", _format_phone_log_line(entry))
+    finally:
+        if handler is not None:
+            handler.setFormatter(old_formatter)
+    return len(entries)
+
+
+def _brief_error(exc: BaseException) -> str:
+    """Одна короткая строка причины битого тела -- для server.log.
+
+    str(ValidationError) pydantic v2 -- это многострочный текст с
+    input_value= (эхо до 256 КБ клиентского payload): в лог пишем только
+    локацию и msg ПЕРВОЙ ошибки (поле input из .errors() не берём),
+    для прочих исключений (не-JSON и т.п.) -- начало str(exc). Всегда
+    ровно одна строка, без содержимого запроса.
+    """
+    errors = getattr(exc, "errors", None)
+    items = errors() if callable(errors) else []
+    if items:
+        first = items[0]
+        loc = ".".join(str(part) for part in first.get("loc", ()))
+        msg = " ".join(str(first.get("msg", "")).split())
+        return f"{loc or '?'}. {msg or type(exc).__name__}"
+    return " ".join(str(exc).split())[:200] or type(exc).__name__
+
+
+@app.post("/debug/log")
+async def debug_log(request: Request) -> dict[str, Any]:
+    """Батч логов телефона -> logs/phone.log; битое тело -> 4xx, не 500."""
+    # 1) Лимит ДО чтения тела: честный content-length сразу даёт 413,
+    #    тело даже не начинаем накапливать (защита памяти/диска).
+    declared = request.headers.get("content-length", "")
+    if declared:
+        try:
+            declared_len = int(declared)
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="битый Content-Length") from None
+        if declared_len > _DEBUG_LOG_MAX_BYTES:
+            raise HTTPException(status_code=413,
+                                detail=_DEBUG_LOG_TOO_LARGE)
+
+    # 2) Потоковое чтение с нарастающим счётчиком: ловим превышение и без
+    #    честного content-length (chunked/врущий клиент); сверх лимита
+    #    тело в память не копим — тот же приём, что в /voice (п. 2.3).
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > _DEBUG_LOG_MAX_BYTES:
+                raise HTTPException(status_code=413,
+                                    detail=_DEBUG_LOG_TOO_LARGE)
+    except HTTPException:
+        raise                       # HTTPException ни в какую ветку не ловим
+    except Exception as exc:  # обрыв чтения тела -> 400
+        log.warning("debug/log: тело не прочиталось (%s)", exc)
+        raise HTTPException(status_code=400,
+                            detail="не удалось прочитать тело") from exc
+
+    # 3) Разбор и валидация — весь блок в try: не-JSON/битые типы ->
+    #    явные 400, ни одного 500 на битом теле. RecursionError ловим
+    #    отдельно: глубокая вложенность JSON в пределах лимита размера
+    #    роняет json.loads рекурсией (тот же приём, что в manifest).
+    try:
+        data = json.loads(bytes(body))
+        batch = PhoneLogBatch.model_validate(data)
+    except (ValueError, TypeError, RecursionError) as exc:
+        # detail -- generic: str(ValidationError) pydantic v2 включает
+        # input_value= (до 256 КБ клиентских данных) -- эхо payload не
+        # отдаём в HTTP-ответ; в server.log уходит ОДНА строка
+        # (_brief_error: класс + loc/msg первой ошибки), тело запроса
+        # в лог не попадает, дублирования в ответе нет.
+        log.warning("debug/log: битое тело (%s: %s)",
+                    type(exc).__name__, _brief_error(exc))
+        raise HTTPException(
+            status_code=400,
+            detail="битое тело запроса (см. server.log)",
+        ) from exc
+
+    written = _write_phone_log_batch(batch.entries)
+    return {"ok": True, "written": written}
 
 
 # --------------------------------------------------------------------------

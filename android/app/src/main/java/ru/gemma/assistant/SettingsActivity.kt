@@ -13,6 +13,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.android.material.materialswitch.MaterialSwitch
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -44,6 +45,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var tvVersion: TextView
     private lateinit var btnUpdate: Button
     private lateinit var progressUpdate: ProgressBar
+    private lateinit var switchPhoneLogs: MaterialSwitch
     private val uiHandler = Handler(Looper.getMainLooper())
 
     /** Машина состояний карточки «Обновление» — ровно 7 (рендер в setUpdateState). */
@@ -69,8 +71,9 @@ class SettingsActivity : AppCompatActivity() {
     // Данные текущей проверки/скачивания (читаются и пишутся на UI-потоке)
     private var availableManifest: Updater.ManifestInfo? = null
     private var downloadedFile: File? = null
-    // Текущая версия приложения: из PackageInfo, а не BuildConfig
-    // (buildConfig в AGP может быть выключен)
+    // Текущая версия приложения: из PackageInfo, а не BuildConfig --
+    // buildConfig в проекте включён явно (build.gradle.kts), но версия
+    // читается из PackageManager независимо от сборочных флагов
     private var appVersionName = "?"
     private var appVersionCode = 0
     // пин, показанный при открытии: если пользователь не трогал поле,
@@ -92,6 +95,7 @@ class SettingsActivity : AppCompatActivity() {
         tvVersion = findViewById(R.id.tvVersion)
         btnUpdate = findViewById(R.id.btnUpdate)
         progressUpdate = findViewById(R.id.progressUpdate)
+        switchPhoneLogs = findViewById(R.id.switchPhoneLogs)
 
         // Подпись версии карточки «Обновление» (PackageInfo, не BuildConfig)
         val (vName, vCode) = packageVersion()
@@ -116,6 +120,13 @@ class SettingsActivity : AppCompatActivity() {
         btnSave.setOnClickListener { saveSettings() }
         btnCheck.setOnClickListener { checkConnection() }
         btnUpdate.setOnClickListener { onUpdateClicked() }
+
+        // «Логи на ПК»: значение живёт отдельно от блока подключения и
+        // сохраняется сразу при переключении (не ждёт «Сохранить»)
+        switchPhoneLogs.isChecked = Settings.phoneLogsEnabled(this)
+        switchPhoneLogs.setOnCheckedChangeListener { _, checked ->
+            Settings.setPhoneLogs(this, checked)
+        }
 
         // Стартовое состояние карточки «Обновление»: keepStatus=true --
         // подсказку из XML («Заполните адрес сервера…») не затираем
@@ -439,7 +450,7 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
-    /** Текущая версия приложения из PackageInfo (BuildConfig может быть выключен). */
+    /** Текущая версия приложения из PackageInfo (независимо от сборочных флагов). */
     private fun packageVersion(): Pair<String, Int> = try {
         val pi = packageManager.getPackageInfo(packageName, 0)
         val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {

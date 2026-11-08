@@ -20,6 +20,13 @@ android {
             isMinifyEnabled = false
         }
     }
+    buildFeatures {
+        // BuildConfig.DEBUG — один из двух факторов гейта канала логов на ПК
+        // (FR-B8, задача 7; ARCHITECTURE.md §5): канал стартует с сервисом всегда,
+        // при DEBUG=false гейт закрыт; публикуемые APK — debug (build-apk.ps1),
+        // так что реально открывает только переключатель «Логи на ПК» (по умолчанию выключен)
+        buildConfig = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

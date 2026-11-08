@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.View
 import android.view.animation.AlphaAnimation
 import android.view.animation.Animation
@@ -188,7 +187,7 @@ class MainActivity : AppCompatActivity() {
                 if (p.isNotBlank() &&
                     Settings.setTunnelPinIfChanged(this, p)
                 ) {
-                    Log.i(TAG, "TOFU: cert pin auto-refreshed on resume")
+                    AppLog.i(TAG, "TOFU: cert pin auto-refreshed on resume")
                     TunnelClient.updatePin(p)
                     runOnUiThread {
                         Toast.makeText(
@@ -551,7 +550,7 @@ class MainActivity : AppCompatActivity() {
                     if (p.isNotBlank()) {
                         val changed = Settings.setTunnelPinIfChanged(this, p)
                         if (changed) {
-                            Log.i(TAG, "TOFU: cert pin updated from /cert")
+                            AppLog.i(TAG, "TOFU: cert pin updated from /cert")
                             // если канал уже крутится со старым пином --
                             // следующая попытка возьмёт новый (без рестарта)
                             TunnelClient.updatePin(p)

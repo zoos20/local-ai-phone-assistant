@@ -2,6 +2,9 @@
 .env
 active_profile.txt
 *.log
+# ротированные бэкапы RotatingFileHandler (phone.log.1..3, server.log.1..3):
+# без этой строки при первой ротации они станут ?? в git status
+*.log.*
 
 # --- локальная документация (не публикуется) ---
 ARCHITECTURE.md
@@ -33,3 +36,6 @@ android/app/release/
 .vscode/
 .idea/
 Thumbs.db
+
+# --- рабочие документы плана/ТЗ фич (решение arch-map, ARCHITECTURE §9) ---
+project-tasks/

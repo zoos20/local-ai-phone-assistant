@@ -1,6 +1,5 @@
 package ru.gemma.assistant
 
-import android.util.Log
 import org.json.JSONObject
 import org.vosk.Recognizer
 
@@ -104,7 +103,7 @@ internal fun feedRecognizerEx(
             false to textOf(rec.partialResult)
         }
     } catch (t: Throwable) {
-        Log.e(TAG, "recognizer error", t)
+        AppLog.e(TAG, "recognizer error", t)
         null
     }
 }

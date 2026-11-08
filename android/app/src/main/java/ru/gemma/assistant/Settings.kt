@@ -19,6 +19,7 @@ object Settings {
     private const val KEY_TOKEN = "api_token"
     private const val KEY_TUNNEL_HOST = "tunnel_host"
     private const val KEY_TUNNEL_PIN = "tunnel_pin"
+    private const val KEY_PHONE_LOGS = "phone_logs"
 
     /** Адрес сервера по умолчанию -- LAN-адрес ПК из README (свой замените). */
     const val DEFAULT_SERVER = "http://192.168.1.100:8090"
@@ -59,6 +60,24 @@ object Settings {
             .apply()
         // Токен нужен ServerClient до любого следующего запроса (профили, /health)
         ServerClient.token = apiToken.trim()
+    }
+
+    /**
+     * Переключатель «Логи на ПК» (in-app канал логов). По умолчанию
+     * ВЫКЛЮЧЕН (KA5): свежая установка ничего не отправляет на сервер.
+     * Читается и пишется независимо от блока подключения: save() его
+     * не затирает (там только строки подключения).
+     */
+    fun phoneLogsEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_PHONE_LOGS, false)
+
+    /**
+     * Запись переключателя «Логи на ПК». commit() вместо apply(): значение
+     * гарантированно оказывается на диске к моменту возврата — KA5
+     * (force-stop сразу после переключения) не теряет состояние.
+     */
+    fun setPhoneLogs(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_PHONE_LOGS, enabled).commit()
     }
 
     /**
