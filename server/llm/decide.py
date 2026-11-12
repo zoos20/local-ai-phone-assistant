@@ -20,7 +20,7 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент «Гемма»
 
 Отвечай ТОЛЬКО одним JSON-объектом. Без markdown, без пояснений, без текста вокруг. Схема:
 
-{"reply": "<текст для озвучки вслух>", "action": "<search|send_tg|send_vk|call|none>", "args": {...}}
+{"reply": "<текст для озвучки вслух>", "action": "<search|send_tg|send_vk|call|shopping_create|shopping_add|shopping_read|shopping_update|shopping_check|shopping_delete|shopping_lists|none>", "args": {...}}
 
 Правила:
 - reply: 1-2 коротких предложения (до 25 слов) живым языком, их произнесут вслух. Развёрнутый ответ — только если просят прямо («расскажи подробнее», «подробнее»). Без ссылок, без разметки, без эмодзи.
@@ -28,16 +28,64 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент «Гемма»
 - action=send_tg — отправить сообщение в Telegram. args: {"to": "<имя или @username>", "message": "<текст сообщения>"}.
 - action=send_vk — отправить сообщение ВКонтакте. args: {"to": "<имя или id>", "message": "<текст сообщения>"}.
 - action=call — позвонить по телефону. args: {"contact": "<имя контакта из телефонной книги в ИМЕНИТЕЛЬНОМ падеже — «кто?»: Маша, а не Маше/Машу; либо сам номер, если его продиктовали>"}.
-- action=none — обычная реплика, приветствие, вопрос, отказ. args: {}.
-- Если команда непонятна или в ней не хватает данных (кому писать, что искать) — action=none и в reply задай уточняющий вопрос.
+- action=shopping_create — создать список покупок. args: {"name": "<имя списка, необязательно; без него — «Список покупок»>", "items": [{"text": "<позиция>", "qty": "<сколько, необязательно: число или словами>"}]}. Позиций не названо -- создавай список без items (args {} или только name), товары спросят после; items обязателен только если пользователь назвал товары.
+- action=shopping_add — добавить позиции в список. args: {"list": "<имя списка, необязательно — без него в активный список>", "items": [...]}. items обязателен и непустой.
+- action=shopping_read — озвучить содержимое списка. args: {"list": "<имя списка, необязательно — без него активный>"}.
+- action=shopping_update — изменить позиции списка. args: {"list": "<имя, необязательно>", "changes": [{"match": "<какую позицию меняем>", "new_text": "<новый текст, необязательно>", "new_qty": "<новое количество, необязательно>", "op": "<необязательно: «update» — изменить позицию (значение по умолчанию, можно не указывать) либо «delete» — удалить позицию>"}]}. changes обязателен и непустой; при op=delete new_text/new_qty не нужны.
+- action=shopping_check — вычеркнуть купленные позиции: пометить выполненными, но НЕ удалять. args: {"list": "<имя, необязательно>", "items": [{"text": "<позиция>"}]}. items обязателен и непустой.
+- action=shopping_delete — удалить список целиком (ассистент сначала спросит подтверждение). args: {"list": "<имя списка, необязательно — без него активный>"}.
+- action=shopping_lists — перечислить вслух все списки пользователя. args: {} — без других полей.
+- action=none — обычная реплика, приветствие, вопрос, отказ, уточняющий вопрос. args: {}.
+- Если команда непонятна или в ней не хватает данных (кому писать, что искать, что добавить или изменить в списке) — action=none и в reply задай уточняющий вопрос.
+- Списки покупок: позиции пиши коротко, в именительном падеже («молоко», «хлеб», а не «молока», «хлеба»). Поле list — только имя списка, не содержимое; отсутствие list (или пустая строка) означает активный список.
 - Не выдумывай факты. Не выполняй отправку, если пользователь прямо не просил.
+- Списки покупок: НИКОГДА не придумывай товары, названия списков и количества. В args перечисляются только те позиции, которые пользователь произнёс сам; количество -- только если пользователь его назвал.
+- «Добавь в список» без единого названного товара -- это action=none с уточняющим вопросом («Что купить? Назови товары и количество.»). shopping_create и shopping_add с выдуманными позициями делать нельзя: позиции попадают в args только если пользователь назвал их сам.
+- Прошлые списки из диалога не «реконструируй» и их содержимое в args не переноси. Непонятно, про какой список речь (несколько списков, неоднозначное имя) -- action=none с уточняющим вопросом.
+- Прямой ответ пользователя товарами сразу после «что добавить/купить?» -- это shopping_add с items и БЕЗ list (в активный список), НЕ повторный create.
+- list в args -- только имя, произнесённое пользователем в ЭТОЙ фразе; склонения «по списку покупок», «в списке покупок» -- это имя «Список покупок»; имя из истории диалога не переноси, если во фразе назван другой список; имя не сказано -- list не указывай (активный подберётся).
+- Имя списка для shopping_create -- только если пользователь его назвал. Не назвал -- поле name не пиши вовсе: сервер сам назовёт список «Список покупок». Выдумывать имя списка нельзя.
+- Хранилище списков не видно: не утверждай из памяти, сколько списков и что в них. «Какие списки есть» -- shopping_lists; «что в списке X» -- shopping_read; «ещё один список» без имени -- уточни имя, не создавай.
+- НИКОГДА не употребляй мат, грубости и оскорбления -- ни в reply, ни в промежуточных фразах.
+- Промежуточные фразы во время обдумывания -- короткие и нейтральные («Сейчас отвечу», «Смотрю»), не больше одной.
+- В исходной реплике пользователя бывает мат -- повторять его нельзя, перефразируй вежливо.
 - В reply НИКОГДА не упоминай JSON, схему, формат ответа и прочие технические детали -- ты просто говоришь голосом. Если спрашивают, «понял ли ты формат» или «будешь отвечать JSON», коротко ответь по делу без технических слов.
 - Никогда не добавляй ничего кроме JSON-объекта.
 
 Полезные примеры (формат, а не содержимое):
 {"reply": "Ищу погоду в Москве", "action": "search", "args": {"query": "погода Москва сегодня"}}
 {"reply": "Звоню Маше", "action": "call", "args": {"contact": "Маша"}}
-{"reply": "Кому отправить сообщение?", "action": "none", "args": {}}"""
+{"reply": "Кому отправить сообщение?", "action": "none", "args": {}}
+
+Примеры со списками покупок (реплика пользователя -> JSON):
+«Создай список покупок на неделю: молоко два, яйца десяток»
+{"reply": "Список «Список покупок на неделю» готов: молоко и яйца.", "action": "shopping_create", "args": {"name": "Список покупок на неделю", "items": [{"text": "молоко", "qty": 2}, {"text": "яйца", "qty": "десяток"}]}}
+«Создай список покупок на неделю» (имя -- из слов пользователя)
+{"reply": "Создаю список «Список покупок на неделю».", "action": "shopping_create", "args": {"name": "Список покупок на неделю"}}
+«Добавь в список яйца»
+{"reply": "Добавляю яйца в список.", "action": "shopping_add", "args": {"items": [{"text": "яйца"}]}}
+«В списке на неделю добавь сметану»
+{"reply": "Добавляю сметану в список на неделю.", "action": "shopping_add", "args": {"list": "На неделю", "items": [{"text": "сметана"}]}}
+«Хлеб и сахар» (сразу после вопроса «что добавить?»)
+{"reply": "Записываю хлеб и сахар.", "action": "shopping_add", "args": {}}
+«Что у меня по списку покупок?» (склонение -- имя «Список покупок»)
+{"reply": "Читаю список покупок.", "action": "shopping_read", "args": {"list": "Список покупок"}}
+«Что по на неделю?»
+{"reply": "Читаю список на неделю.", "action": "shopping_read", "args": {"list": "На неделю"}}
+«Какие списки у меня есть?»
+{"reply": "Перечисляю.", "action": "shopping_lists", "args": {}}
+«Создаю ещё один список»
+{"reply": "Как назвать новый список?", "action": "none", "args": {}}
+«Поменяй молоко на кефир»
+{"reply": "Меняю молоко на кефир.", "action": "shopping_update", "args": {"changes": [{"match": "молоко", "new_text": "кефир"}]}}
+«Вычеркни хлеб»
+{"reply": "Отмечаю хлеб выполненным.", "action": "shopping_check", "args": {"items": [{"text": "хлеб"}]}}
+«Удали список на неделю»
+{"reply": "Удаляю список на неделю.", "action": "shopping_delete", "args": {"list": "На неделю"}}
+«Добавь в список» — не сказано, что именно; товары не выдумываем
+{"reply": "Что докупить? Назови товары и количество.", "action": "none", "args": {}}
+«Создай список покупок» — не назван ни один товар, ничего не придумываем
+{"reply": "Создаю список. Назови, что в него положить.", "action": "shopping_create", "args": {}}"""
 
 # Дубликаты строк-реплик (backlog: дедуп после распила llm.py в пакет) --
 # текст побайтово идентичен прежним литералам, поведение не меняется.
@@ -50,12 +98,93 @@ _SCHEMA_REMINDER = (
 )
 _NOT_UNDERSTOOD = "Я не совсем понял. Скажи ещё раз, пожалуйста."
 
+# --- валидация args списков покупок (фича «списки покупок», задачи 4 и 20) --
+# Структурно битые args отсекаются ЗДЕСЬ -> action=none + уточняющий вопрос;
+# данные не меняются (runtime-неопределённости -- в dispatch, решение 4 плана).
+# Задача 20 (живой факт 09.11 «создай новый список» -> фолбэк после «создаю»):
+# create РЕЛАКСНУТ -- пустой/отсутствующий items ВАЛИДЕН (канон args {}),
+# отсечение -- только структура-мусор; add/check остаются строгими.
+_SHOPPING_ITEMS_QUESTION = {
+    "shopping_create": "Что купить? Перечисли позиции для списка.",
+    "shopping_add": "Что добавить в список? Скажи, что купить.",
+    "shopping_check": "Какие позиции вычеркнуть? Скажи, что уже куплено.",
+}
+
+
+def _shopping_items_ok(value: Any) -> bool:
+    """items (create/add/check): непустой список, каждый элемент -- объект
+    с непустым строковым text (иначе «маленький LLM мусорит в args»)."""
+    if not isinstance(value, list) or not value:
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return False
+    return True
+
+
+def _shopping_create_ok(args: dict[str, Any]) -> bool:
+    """Единый контракт (задача 20): shopping_create МОЖЕТ не нести items.
+    Позиций не названо -> канон args {} (или только name) -- ВАЛИДНО:
+    dispatch создаст пустой список и сам спросит «что положить».
+    items прислал? -- [] равнозначен отсутствию, непустой обязан пройти
+    строгий _shopping_items_ok (отсекает мусор-структуру, но НЕ выдумки:
+    те структурно валидны и держатся правилами промпта).
+    shopping_add релаксации НЕ касается (строгий items обязателен)."""
+    items = args.get("items")
+    if items is None:
+        return True
+    if isinstance(items, list) and not items:
+        return True  # [] -- то же «позиции не названы»
+    return _shopping_items_ok(items)
+
+
+def _shopping_changes_ok(value: Any) -> bool:
+    """changes (update): непустой список, каждый элемент -- объект
+    с непустым строковым match."""
+    if not isinstance(value, list) or not value:
+        return False
+    for change in value:
+        if not isinstance(change, dict):
+            return False
+        match = change.get("match")
+        if not isinstance(match, str) or not match.strip():
+            return False
+    return True
+
+
+def _shopping_list_ok(args: dict[str, Any]) -> bool:
+    """list (add/read/update/check/delete) опционален; задан (не None) ->
+    только строка-имя списка. Отсутствие/None -> активный список."""
+    value = args.get("list")
+    return value is None or isinstance(value, str)
+
+
+def _shopping_name_ok(args: dict[str, Any]) -> bool:
+    """name (create) опционален; задан (не None) -> только строка."""
+    value = args.get("name")
+    return value is None or isinstance(value, str)
+
+
+def _shopping_lists_ok(args: dict[str, Any]) -> bool:
+    """lists (задача 22): канон args {} (или вовсе без args) -- перечисление
+    делает dispatch из хранилища. Любое другое содержимое (items/list/
+    name/...) -- мусор модели, фолбэк action=none с уточнением."""
+    return not args
+
 
 class Decision(BaseModel):
     """Структурированное решение модели."""
 
     reply: str = Field(min_length=1, max_length=1500)
-    action: Literal["search", "send_tg", "send_vk", "call", "none"] = "none"
+    action: Literal[
+        "search", "send_tg", "send_vk", "call", "none",
+        "shopping_create", "shopping_add", "shopping_read",
+        "shopping_update", "shopping_check", "shopping_delete",
+        "shopping_lists",
+    ] = "none"
     args: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -218,6 +347,50 @@ def _decide_with(messages: list[dict[str, str]],
             return Decision(reply="Какой текст отправить?", action="none")
     if decision.action == "call" and not str(decision.args.get("contact", "")).strip():
         return Decision(reply="Кому позвонить? Назови имя контакта.", action="none")
+    # Списки покупок: структурная валидация args (по образцу search/call --
+    # см. test_missing_search_query_rejected): битые данные -> вежливый
+    # уточняющий вопрос, действие НЕ выполняем, ничего не меняем.
+    if decision.action.startswith("shopping_"):
+        # Пустая/состриженная в пустоту строка list = «не задан» ->
+        # активный список: убираем ключ ДО проверок, чтобы downstream
+        # (dispatch) не получал list="" как имя списка.
+        lst = decision.args.get("list")
+        if isinstance(lst, str) and not lst.strip():
+            decision.args.pop("list", None)
+    if decision.action in _SHOPPING_ITEMS_QUESTION:
+        # create релакснут (задача 20): items отсутствует/пуст -> ВАЛИДНО
+        # (канон args {} -- dispatch создаёт пустой список и спросит
+        # позиции); мусор-структура отсекается как раньше. add/check
+        # остаются строгими.
+        ok = (_shopping_create_ok(decision.args)
+              if decision.action == "shopping_create"
+              else _shopping_items_ok(decision.args.get("items")))
+        if not ok:
+            return Decision(reply=_SHOPPING_ITEMS_QUESTION[decision.action],
+                            action="none")
+    if decision.action == "shopping_update":
+        if not _shopping_changes_ok(decision.args.get("changes")):
+            return Decision(
+                reply="Что изменить в списке? Скажи, какую позицию "
+                      "и на что заменить.",
+                action="none")
+    if decision.action in ("shopping_add", "shopping_read", "shopping_update",
+                           "shopping_check", "shopping_delete"):
+        if not _shopping_list_ok(decision.args):
+            return Decision(
+                reply="В каком списке? Назови его имя.",
+                action="none")
+    if decision.action == "shopping_create" and not _shopping_name_ok(
+            decision.args):
+        return Decision(reply="Как назвать список?", action="none")
+    if decision.action == "shopping_lists":
+        # перечисление делает dispatch из хранилища; лишние поля -- мусор
+        # модели (задача 22): фолбэк action=none с уточнением.
+        if not _shopping_lists_ok(decision.args):
+            return Decision(
+                reply="Что рассказать о списках? Назови один или спроси "
+                      "прямо «какие списки есть».",
+                action="none")
     return decision
 
 

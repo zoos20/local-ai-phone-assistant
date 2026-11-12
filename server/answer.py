@@ -14,6 +14,7 @@ from dialog_state import (
 )
 from dispatch import _dispatch
 from profile_detect import detect_profile_command
+from reply_sanitize import sanitize_reply
 
 log = logging.getLogger("assistant")
 
@@ -25,9 +26,11 @@ async def _answer(text: str,
     """Общая цепочка: текст -> решение модели -> действие -> ответ.
 
     on_sentence/on_first_token/on_query (фаза 6, п. 1) -- включают
-    стриминговый путь decide_stream: предложения reply уходят на озвучку,
-    пока генерация ещё идёт (первый токен ~0.3-0.5 с вместо ожидания
-    полного ответа). Без них -- прежний decide() (POST /voice, /ask).
+    стриминговый путь decide_stream: предложения reply отдаются
+    консумеру, пока генерация ещё идёт (первый токен ~0.3-0.5 с вместо
+    ожидания полного ответа). /ask его не подключает (блокирующий
+    decide()); /ws_voice подключает, но с гейта задачи 16 mid-stream
+    предложения в TTS НЕ идут -- озвучивается только финальный reply.
     """
     t0 = time.perf_counter()
     log.info("ask: %r", text)
@@ -136,7 +139,31 @@ async def _answer(text: str,
         log.info("decision: action=%s args=%s (llm %d ms)",
                  decision.action, decision.args, llm_ms)
 
-    reply, needs_confirm, token = await _dispatch(decision)
+    # Итоговый reply может ОТЛИЧАТЬСЯ от реплики модели, УЖЕ отстриманной
+    # через on_sentence: dispatch заменяет её фолбэком-уточнением (нет
+    # активного списка / неоднозначное имя — задача 14, критерий S8) либо
+    # возвращает детерминированный шаблон (чтение/эхо списков — S3).
+    # Флаг reply_replaced -- ИНФОРМАЦИОННЫЙ (закреплён тестами): после
+    # задачи 16 voice_ws синтезирует финальный reply БЕЗУСЛОВНО после
+    # готовности решения (mid-stream болтовня в TTS не уходит вовсе),
+    # так что гейт на этом поле больше не ветвит логику; /ask поле
+    # отсекает через response_model=AskResponse. Формат истории НЕ
+    # меняется: _history_digest(decision, reply) работает с тем же
+    # decision.
+    model_reply = decision.reply
+    # text -- для детерминированной сетки фразы в dispatch (задача 24):
+    # resolve адресата сверяет токены ФРАЗЫ с именами списков и
+    # пере-записывает галлюцинации args.list из истории. REST /confirm
+    # _dispatch не зовёт -- там text не нужен.
+    reply, needs_confirm, token = await _dispatch(decision, text=text)
+    # Санитайзер профанизма (задача 21 + фоллоу-ап ревью): точка на
+    # общем пути _answer -- REST /ask+/voice, история ниже и /ws_voice
+    # (он отправляет resp.reply в TTS). POST /confirm собирает реплику
+    # ОТДЕЛЬНО от _answer (server.py) -- там каждый выход реплики
+    # санитайзится ЯВНЫМ вызовом sanitize_reply. Пользовательские
+    # args/items и шаблоны dispatch не санитайзятся; идемпотентно
+    # (чистый текст 1:1).
+    reply = sanitize_reply(reply)
     elapsed = int((time.perf_counter() - t0) * 1000)
     log.info("reply in %d ms: %r", elapsed, reply)
     # В историю кладём реплику ассистента в JSON-схеме {reply, action, args}
@@ -149,4 +176,5 @@ async def _answer(text: str,
     # /ask отдаёт его через response_model=AskResponse, лишние поля отфильтруются.
     return VoiceResponse(reply=reply, action=decision.action, args=decision.args,
                          needs_confirm=needs_confirm, token=token,
-                         elapsed_ms=elapsed)
+                         elapsed_ms=elapsed,
+                         reply_replaced=reply != model_reply)

@@ -65,7 +65,30 @@ if (-not $addr) {
 $ip = ($addr.IPAddress -split '%')[0]   # strip zone id if present
 
 $query = "hostname=$([uri]::EscapeDataString($hostname))&token=$([uri]::EscapeDataString($token))&ipv6=$([uri]::EscapeDataString($ip))"
-if (-not $NoIPv4) { $query += '&ipv4=auto' }   # A record for the IPv4-only mobile net
+if (-not $NoIPv4) {
+    # ipv4=auto does not work when this request leaves via IPv6 (dynv6 has
+    # AAAA records, Windows prefers IPv6): dynv6 sees no source IPv4 and
+    # silently keeps the STALE A record. Fix (2026-11-09): detect the public
+    # IPv4 explicitly and send it. curl.exe -4 forces the IPv4 transport.
+    # On failure fall back to the old "auto" behavior (better than failing).
+    $ip4 = $null
+    foreach ($p in @('https://v4.ident.me/ip', 'https://api.ipify.org')) {
+        try {
+            $r = curl.exe -4 -s --max-time 10 $p 2>$null
+            if ($LASTEXITCODE -eq 0 -and $r -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $ip4 = $r.Trim()
+                break
+            }
+        } catch { }
+    }
+    if ($ip4) {
+        $query += "&ipv4=$([uri]::EscapeDataString($ip4))"
+        Write-Host "[ddns] public IPv4 detected: $ip4"
+    } else {
+        $query += '&ipv4=auto'   # A record for the IPv4-only mobile net
+        Write-Host '[ddns] WARN: public IPv4 not detected, falling back to ipv4=auto'
+    }
+}
 
 try {
     $resp = Invoke-WebRequest -Uri "https://dynv6.com/api/update?$query" `

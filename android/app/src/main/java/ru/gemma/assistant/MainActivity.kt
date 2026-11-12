@@ -86,6 +86,7 @@ class MainActivity : AppCompatActivity() {
         bindToggle()
         bindProfileControls()
         bindSettingsButton()
+        bindShoppingListsButton()
         clearButtonTints()
 
         ensureModelInstalled()
@@ -138,6 +139,13 @@ class MainActivity : AppCompatActivity() {
         // Меню настроек: адрес сервера, DDNS, токен, пин (отдельный экран)
         findViewById<View>(R.id.btnSettings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+    }
+
+    private fun bindShoppingListsButton() {
+        // Списки покупок: отдельный UI-экран (по образцу bindSettingsButton)
+        findViewById<View>(R.id.btnShoppingLists).setOnClickListener {
+            startActivity(Intent(this, ShoppingListsActivity::class.java))
         }
     }
 

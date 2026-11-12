@@ -13,6 +13,11 @@
     GET  /update/manifest — manifest.json релиза APK (обновление по воздуху)
     GET  /update/apk      — скачивание APK (телефон ставит обновление)
     POST /debug/log       — батч логов телефона {"entries":[...]} -> logs/phone.log
+    GET  /shopping/lists        — все списки покупок {"lists": [...]}
+    POST /shopping/lists        — создать список {"name"?} -> 201 объект
+    GET    /shopping/lists/{id} — один список; открытый -> активный (решение 2)
+    PATCH  /shopping/lists/{id} — {"name"?, "items"?}; items = полная замена
+    DELETE /shopping/lists/{id} — 200 {"ok": true}
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 import llm
+import shopping_store
 import tools
 from answer import _answer
 from api_models import (
@@ -43,12 +49,17 @@ from api_models import (
     PhoneLogBatch,
     PhoneLogEntry,
     ProfileSetRequest,
+    ShoppingListCreate,
+    ShoppingListOut,
+    ShoppingListPatch,
+    ShoppingListsOut,
     TtsRequest,
     VoiceResponse,
 )
 from config import settings
 from dialog_state import _digest_text, _gc_pending, _pending, add_turn, reset_history
 from profile_detect import _fuzzy_profile, detect_profile_command  # noqa: F401
+from reply_sanitize import sanitize_reply
 from search import _PREFETCH_TTL_S, _prefetch_cache, _prefetch_key, _run_search
 from voice_ws import router
 
@@ -301,7 +312,9 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
     if pending is None:
         log.info("confirm: token=%s NOT FOUND (yes=%s, known=%d pending)",
                  req.token[:4] + "…", req.yes, len(_pending))
-        return ConfirmResponse(reply="Это подтверждение уже истекло.", ok=False)
+        # Единообразие: все reply-сборки /confirm чисты (здесь статическая).
+        reply = sanitize_reply("Это подтверждение уже истекло.")
+        return ConfirmResponse(reply=reply, ok=False)
     log.info("confirm: token=%s found action=%s yes=%s ttl_left=%.0fs",
              req.token[:4] + "…", pending.action, req.yes,
              max(0.0, pending.expires - time.time()))
@@ -311,10 +324,12 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
         if pending.action == "search":
             reply = await asyncio.to_thread(
                 llm.answer_from_memory, str(pending.args["query"]))
+            reply = sanitize_reply(reply)      # модель: мат вырезаем
             await add_turn("assistant", _digest_text(reply))
             return ConfirmResponse(reply=reply, ok=True)
-        await add_turn("assistant", "Хорошо, отменил.")
-        return ConfirmResponse(reply="Хорошо, отменил.", ok=True)
+        reply = sanitize_reply("Хорошо, отменил.")
+        await add_turn("assistant", reply)
+        return ConfirmResponse(reply=reply, ok=True)
 
     try:
         if pending.action == "send_tg":
@@ -333,10 +348,23 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
             # телефонной книге, у ПК доступа к контактам нет). Мы лишь
             # отдаём команду на звонок + короткую реплику для озвучки.
             contact = str(pending.args.get("contact", ""))
-            reply = f"Звоню {contact}."
+            # контакт -- user-данные (args не санитайзим), только реплика
+            reply = sanitize_reply(f"Звоню {contact}.")
             await add_turn("assistant", _digest_text(reply))
             return ConfirmResponse(reply=reply, ok=True, action="call",
                                    args={"contact": contact})
+        elif pending.action == "shopping_delete":
+            # Списки покупок (задача 3): реально удаляем ТОЛЬКО здесь, по «да».
+            # ConfirmResponse.action НЕ трогаем — телефон выполняет только
+            # call; в ответе остаётся прежнее значение по умолчанию (none).
+            list_id = str(pending.args.get("list_id", ""))
+            await shopping_store.delete(list_id)
+            name = str(pending.args.get("name", "")).strip()
+            # имя списка -- user-данные; чистим только строку-реплику
+            reply = sanitize_reply(f"Список «{name}» удалён." if name
+                                   else "Список удалён.")
+            await add_turn("assistant", _digest_text(reply))
+            return ConfirmResponse(reply=reply, ok=True)
         else:
             reply = await asyncio.to_thread(tools.vk_send, pending.args["to"],
                                             pending.args["message"])
@@ -344,15 +372,25 @@ async def confirm(req: ConfirmRequest) -> ConfirmResponse:
         if isinstance(exc, asyncio.TimeoutError):
             exc = tools.ToolError("Поиск не ответил за 15 секунд. "
                                   "Попробуй спросить иначе.")
-        await add_turn("assistant", str(exc))
-        return ConfirmResponse(reply=str(exc), ok=False)
+        reply = sanitize_reply(str(exc))   # вежливые ошибки тоже чисты
+        await add_turn("assistant", reply)
+        return ConfirmResponse(reply=reply, ok=False)
+    except shopping_store.ShoppingStoreError as exc:
+        # Ошибка хранилища списков — вежливая реплика, не 500 (задача 3).
+        log.warning("confirm shopping: %s", exc)
+        reply = sanitize_reply(str(exc))
+        await add_turn("assistant", reply)
+        return ConfirmResponse(reply=reply, ok=False)
     except Exception:
         log.exception("confirm: unexpected error")
-        await add_turn("assistant",
-                       "Не получилось выполнить действие, попробуй ещё раз.")
-        return ConfirmResponse(reply="Не получилось выполнить действие, "
-                               "попробуй ещё раз.", ok=False)
+        reply = sanitize_reply("Не получилось выполнить действие, "
+                               "попробуй ещё раз.")
+        await add_turn("assistant", reply)
+        return ConfirmResponse(reply=reply, ok=False)
 
+    # Финальная реплика (send_tg / vk_send / да-ветка поиска: текст
+    # суммаризации -- ВЕБ). Санитайзер до ConfirmResponse и до истории.
+    reply = sanitize_reply(reply)
     await add_turn("assistant", _digest_text(reply))
     return ConfirmResponse(reply=reply, ok=True)
 
@@ -540,11 +578,30 @@ def _brief_error(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:200] or type(exc).__name__
 
 
-@app.post("/debug/log")
-async def debug_log(request: Request) -> dict[str, Any]:
-    """Батч логов телефона -> logs/phone.log; битое тело -> 4xx, не 500."""
-    # 1) Лимит ДО чтения тела: честный content-length сразу даёт 413,
-    #    тело даже не начинаем накапливать (защита памяти/диска).
+async def _read_json_body(request: Request, max_bytes: int, tag: str,
+                          too_large: str, empty_ok: bool = False) -> Any:
+    """Читает JSON-тело запроса с лимитом; битое -> 400, перелимит -> 413.
+
+    ОБЩИЙ приём POST /debug/log и PATCH/POST /shopping/lists/{id} (follow-up
+    ревью: дубликат читателя тела вынесен из _shopping_read_body).
+    Поведение обоих роутов байт-в-байт прежнее:
+      1) лимит ДО чтения тела: честный Content-Length сразу даёт 413
+         (защита памяти/диска), битый Content-Length -> 400;
+      2) потоковое чтение с нарастающим счётчиком — ловит превышение и без
+         честного content-length (chunked/врущий клиент), сверх лимита тело
+         в память не копим (тот же приём, что в /voice, п. 2.3); обрыв
+         чтения -> 400;
+      3) разбор JSON — весь в try: не-JSON -> 400, НЕ 500 (RecursionError
+         отдельно: глубокая вложенность в пределах лимита роняет json.loads
+         рекурсией — тот же приём, что в /update/manifest);
+      4) пустое тело: по умолчанию -> 400 (как раньше), при empty_ok=True
+         -> {} (тело опционально: POST /shopping/lists — нет тела == нет
+         полей, дефолтное имя стора).
+    Всегда generic detail без эха payload; причина — ОДНА строка в server.log
+    через _brief_error. tag — префикс лог-строк роута, too_large — detail
+    для 413 (тексты роутов различались «лимит»/«лимита», сохранены как были).
+    """
+    # 1) Честный Content-Length ДО чтения: огромное тело не накапливаем.
     declared = request.headers.get("content-length", "")
     if declared:
         try:
@@ -552,33 +609,56 @@ async def debug_log(request: Request) -> dict[str, Any]:
         except ValueError:
             raise HTTPException(status_code=400,
                                 detail="битый Content-Length") from None
-        if declared_len > _DEBUG_LOG_MAX_BYTES:
-            raise HTTPException(status_code=413,
-                                detail=_DEBUG_LOG_TOO_LARGE)
+        if declared_len > max_bytes:
+            raise HTTPException(status_code=413, detail=too_large)
 
-    # 2) Потоковое чтение с нарастающим счётчиком: ловим превышение и без
-    #    честного content-length (chunked/врущий клиент); сверх лимита
-    #    тело в память не копим — тот же приём, что в /voice (п. 2.3).
+    # 2) Потоковое чтение с нарастающим счётчиком.
     body = bytearray()
     try:
         async for chunk in request.stream():
             body += chunk
-            if len(body) > _DEBUG_LOG_MAX_BYTES:
-                raise HTTPException(status_code=413,
-                                    detail=_DEBUG_LOG_TOO_LARGE)
+            if len(body) > max_bytes:
+                raise HTTPException(status_code=413, detail=too_large)
     except HTTPException:
         raise                       # HTTPException ни в какую ветку не ловим
     except Exception as exc:  # обрыв чтения тела -> 400
-        log.warning("debug/log: тело не прочиталось (%s)", exc)
+        log.warning("%s: тело не прочиталось (%s)", tag, exc)
         raise HTTPException(status_code=400,
                             detail="не удалось прочитать тело") from exc
 
-    # 3) Разбор и валидация — весь блок в try: не-JSON/битые типы ->
-    #    явные 400, ни одного 500 на битом теле. RecursionError ловим
-    #    отдельно: глубокая вложенность JSON в пределах лимита размера
-    #    роняет json.loads рекурсией (тот же приём, что в manifest).
+    # Тело опционально (empty_ok): пустое (в т.ч. chunked без данных) ->
+    # «нет полей» {}; непустое идёт в разбор ниже как раньше.
+    if empty_ok and not body:
+        return {}
+
+    # 3) Разбор JSON — весь в try: не-JSON -> 400, ни одного 500.
     try:
-        data = json.loads(bytes(body))
+        return json.loads(bytes(body))
+    except (ValueError, TypeError, RecursionError) as exc:
+        # detail -- generic: str(ValidationError) pydantic v2 включает
+        # input_value= (до 256 КБ клиентских данных) -- эхо payload не
+        # отдаём в HTTP-ответ; в server.log уходит ОДНА строка
+        # (_brief_error: класс + loc/msg первой ошибки), тело запроса
+        # в лог не попадает, дублирования в ответе нет.
+        log.warning("%s: битое тело (%s: %s)", tag,
+                    type(exc).__name__, _brief_error(exc))
+        raise HTTPException(
+            status_code=400,
+            detail="битое тело запроса (см. server.log)",
+        ) from exc
+
+
+@app.post("/debug/log")
+async def debug_log(request: Request) -> dict[str, Any]:
+    """Батч логов телефона -> logs/phone.log; битое тело -> 4xx, не 500."""
+    # Чтение тела и разбор JSON — общий helper _read_json_body (лимиты,
+    # коды 400/413, generic detail и логи не изменились).
+    data = await _read_json_body(request, _DEBUG_LOG_MAX_BYTES,
+                                 "debug/log", _DEBUG_LOG_TOO_LARGE)
+
+    # Валидация схемы батча — весь блок в try: битые типы ->
+    # явные 400, ни одного 500 на битом теле.
+    try:
         batch = PhoneLogBatch.model_validate(data)
     except (ValueError, TypeError, RecursionError) as exc:
         # detail -- generic: str(ValidationError) pydantic v2 включает
@@ -765,6 +845,186 @@ async def update_apk() -> FileResponse:
         filename=apk_path.name,
         stat_result=st,
     )
+
+
+# --------------------------------------------------------------------------
+# Списки покупок (фича «Списки покупок», задача 2): REST поверх shopping_store.
+#
+#   GET    /shopping/lists       -> 200 {"lists": [...]}
+#   POST   /shopping/lists       -> 201 объект; тело {"name"?} ОПЦИОНАЛЬНО
+#                                   (нет/{}/пустое имя -> дефолтное имя
+#                                   стора, роут не дублирует); созданный
+#                                   сразу активен — create + set_active
+#                                   теми же вызовами стора, что в голосовой
+#                                   ветке shopping_create (решение 2;
+#                                   создание из UI — задача 18, UX-спека §7)
+#   GET    /shopping/lists/{id}  -> 200 объект списка; ОТКРЫТИЕ в UI делает
+#                                   его активным (решение 2); нет -> 404
+#   PATCH  /shopping/lists/{id}  -> 200 обновлённый объект; тело
+#                                   {"name"?: str, "items"?: [...]}, где
+#                                   items — ПОЛНАЯ замена массива позиций
+#                                   (решение 3, last-write-wins)
+#   DELETE /shopping/lists/{id}  -> 200 {"ok": true}; нет -> 404
+#
+# Все роуты под мидлварем require_api_token; в _TOKEN_EXEMPT их НЕ добавляем
+# (закреплено тестом). Лимит тела PATCH/POST — 64 КБ, проверка ДО чтения ->
+# 413 (чтение тела — общий helper _read_json_body, общий с POST /debug/log;
+# у POST тело также может отсутствовать — пустое тело == {}). Битое/не-JSON
+# тело -> 400, НЕ 500 (detail generic без эхо payload, причина
+# — одна строка в server.log). Ошибки
+# хранилища: ShoppingNotFound -> 404, ShoppingBadRequest -> 400,
+# ShoppingStoreError -> 500 generic (текст исключения и стек наружу не идут).
+# --------------------------------------------------------------------------
+# Лимит тела PATCH/POST (решение плана №6): 64 КБ, проверка ДО чтения -> 413.
+_SHOPPING_MAX_BYTES = 64 * 1024
+# Общий detail для обеих веток 413 (по Content-Length и потоковым счётчиком) —
+# по образцу _DEBUG_LOG_TOO_LARGE (текст передаётся в _read_json_body).
+_SHOPPING_TOO_LARGE = (f"тело запроса больше лимит "
+                       f"{_SHOPPING_MAX_BYTES // 1024} КБ")
+
+
+def _shopping_http_error(exc: shopping_store.ShoppingStoreError) -> HTTPException:
+    """Маппинг исключений хранилища -> HTTP; detail без стека и без путей."""
+    if isinstance(exc, shopping_store.ShoppingNotFound):
+        # Сообщения стора вежливые, по-русски, без путей — отдаём как есть.
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, shopping_store.ShoppingBadRequest):
+        return HTTPException(status_code=400, detail=str(exc))
+    # I/O-сбой и битый файл: наружу generic, причина — только в server.log.
+    log.warning("shopping: ошибка хранилища: %s", exc)
+    return HTTPException(status_code=500,
+                         detail="хранилище списков недоступно, попробуйте позже")
+
+
+@app.get("/shopping/lists", response_model=ShoppingListsOut)
+async def shopping_lists_get() -> dict[str, Any]:
+    """Все списки: 200 {"lists": [...]} (контракт Android parseLists)."""
+    try:
+        lists = await shopping_store.list_lists()
+    except shopping_store.ShoppingStoreError as exc:
+        raise _shopping_http_error(exc) from None
+    return {"lists": lists}
+
+
+@app.post("/shopping/lists", response_model=ShoppingListOut, status_code=201)
+async def shopping_lists_post(request: Request) -> dict[str, Any]:
+    """Создание списка (из UI, задача 18): тело {"name"?} опционально.
+
+    201 + полный объект списка (тот же ключевой набор, что у GET
+    /shopping/lists/{id}). Нет тела / {} / пустое-после-трима имя -> 201
+    с дефолтным именем стора (роут имя не тримит и дефолт не дублирует —
+    это делает shopping_store.create). Созданный список сразу становится
+    активным — create + set_active теми же вызовами стора, что в голосовой
+    ветке shopping_create (решение 2 плана: «последний созданный активен»);
+    как в PATCH — два ПОСЛЕДОВАТЕЛЬНЫХ захвата state.shopping_lock,
+    интерливинг конкурентного запроса между ними допущен правилом
+    «последняя запись». Битое/не-объектное тело -> 400 generic, > 64 КБ
+    -> 413 (общий _read_json_body, empty_ok=True — тело опционально);
+    ошибка хранилища -> _shopping_http_error (404/400/500 generic).
+    """
+    data = await _read_json_body(request, _SHOPPING_MAX_BYTES, "shopping",
+                                 _SHOPPING_TOO_LARGE, empty_ok=True)
+    try:
+        post = ShoppingListCreate.model_validate(data)
+    except (ValueError, TypeError, RecursionError) as exc:
+        # Нестроковый name (число/список) и не-объектное тело (строка,
+        # массив, число) -> 400; detail generic без эха payload — тот же
+        # отказ, что у PATCH.
+        log.warning("shopping: битое тело POST (%s: %s)",
+                    type(exc).__name__, _brief_error(exc))
+        raise HTTPException(
+            status_code=400,
+            detail="битое тело запроса (см. server.log)",
+        ) from exc
+    try:
+        lst = await shopping_store.create(name=post.name)
+        await shopping_store.set_active(lst["id"])
+    except shopping_store.ShoppingStoreError as exc:
+        raise _shopping_http_error(exc) from None
+    return lst
+
+
+@app.get("/shopping/lists/{list_id}", response_model=ShoppingListOut)
+async def shopping_list_get(list_id: str) -> dict[str, Any]:
+    """Один список; открытие в UI делает его активным (решение 2).
+
+    Не найден -> 404; при 404 активный список НЕ меняется (set_active
+    идёт после get).
+    """
+    try:
+        lst = await shopping_store.get(list_id)
+        await shopping_store.set_active(list_id)
+    except shopping_store.ShoppingStoreError as exc:
+        raise _shopping_http_error(exc) from None
+    return lst
+
+
+@app.patch("/shopping/lists/{list_id}", response_model=ShoppingListOut)
+async def shopping_list_patch(list_id: str, request: Request) -> dict[str, Any]:
+    """Частичное обновление: {"name"?: str, "items"?: [...]} (решение 3).
+
+    items — ПОЛНАЯ замена массива позиций (id из тела сохраняется, нет id —
+    новая позиция). Пустое тело и пустые/битые поля -> 400 (не 500),
+    перелимит тела -> 413, неизвестный id -> 404.
+    """
+    data = await _read_json_body(request, _SHOPPING_MAX_BYTES,
+                                 "shopping", _SHOPPING_TOO_LARGE)
+    try:
+        patch = ShoppingListPatch.model_validate(data)
+    except (ValueError, TypeError, RecursionError) as exc:
+        # Нестроковый name, items не-список, позиция без text и т.п. —
+        # всё это «битое поле» -> 400; detail generic, эха payload нет.
+        log.warning("shopping: битое тело PATCH (%s: %s)",
+                    type(exc).__name__, _brief_error(exc))
+        raise HTTPException(
+            status_code=400,
+            detail="битое тело запроса (см. server.log)",
+        ) from exc
+    if patch.name is None and patch.items is None:
+        # Оба поля None (в т.ч. {"name": null, "items": null}) -> 400:
+        # без этой проверки обновлять нечего и lst вернулся бы None -> 500.
+        raise HTTPException(status_code=400, detail="нет полей для обновления")
+    if patch.name is not None and not patch.name.strip():
+        # Пустое/пробельное имя -> 400 ДО set_items (тот же отказ и detail,
+        # что в shopping_store.rename): иначе rename отклонил бы имя уже
+        # ПОСЛЕ применения items — частичное применение при 400 (QA).
+        # Нестроковый name pydantic отсекает на model_validate выше.
+        raise HTTPException(status_code=400,
+                            detail="Имя списка не может быть пустым.")
+    try:
+        # items первым: у полной замены больше проверок (дубли id и т.п.),
+        # их отказы отсекаются ДО переименования; пустое имя отсечено выше,
+        # поэтому 400 здесь не оставляет применённых items.
+        #
+        # Честно про лок: две операции — это два ПОСЛЕДОВАТЕЛЬНЫХ захвата
+        # state.shopping_lock (комбинированной операции в сторе нет), а не
+        # один общий лок: интерливинг конкурентного запроса между ними
+        # возможен и допущен правилом «последняя запись» (решение 3).
+        # От частичного применения от ОШИБОК это не зависит: set_items
+        # атомарен (исключение поднимается до _save, файл не меняется).
+        lst: dict[str, Any] | None = None
+        if patch.items is not None:
+            lst = await shopping_store.set_items(
+                list_id, [it.model_dump() for it in patch.items])
+        if patch.name is not None:
+            lst = await shopping_store.rename(list_id, patch.name)
+    except shopping_store.ShoppingStoreError as exc:
+        raise _shopping_http_error(exc) from None
+    # Оба поля None отсечены выше -> lst задан (type checker'а в проекте нет).
+    return lst
+
+
+@app.delete("/shopping/lists/{list_id}")
+async def shopping_list_delete(list_id: str) -> dict[str, bool]:
+    """Удаление списка: 200 {"ok": true}; неизвестный id -> 404.
+
+    Удаление активного списка сбрасывает state.active_list_id (стор).
+    """
+    try:
+        await shopping_store.delete(list_id)
+    except shopping_store.ShoppingStoreError as exc:
+        raise _shopping_http_error(exc) from None
+    return {"ok": True}
 
 
 def main() -> None:

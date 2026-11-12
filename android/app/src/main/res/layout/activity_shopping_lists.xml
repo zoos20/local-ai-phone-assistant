@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Гемма — экран «Списки покупок»: шапка (назад + обновить + «Создать
+     список»), состояния загрузка/данные/пусто/нет связи (ScreenState из
+     ShoppingModels), список всех списков. Стиль — activity_settings.xml /
+     activity_main.xml: лавандовый фон, карточки bg_card, тихие borderless-
+     экшены в шапке (как «Списки» на главном), градиентная CTA — только
+     главное действие. Статус строки центрируется в нижней зоне экрана
+     (FrameLayout weight=1) — «Загружаю…» и «Нет связи…» смотрятся по центру,
+     а не прижаты к шапке. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_app"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <!-- Шапка: назад + заголовок + «Обновить» (тихое) + «Создать список»
+         (главное градиентное действие, wiring — задача 18) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="20dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageButton
+            android:id="@+id/btnBack"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Назад"
+            android:padding="8dp"
+            android:src="@drawable/ic_arrow_back" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Списки покупок"
+            android:textColor="@color/text_primary"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+
+        <!-- Обновление списков: по образцу btnShoppingLists главного экрана —
+             borderless-текст, id не меняется (используется в Kotlin) -->
+        <Button
+            android:id="@+id/btnRefresh"
+            style="@style/Widget.Gemma.TextAction"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:text="Обновить" />
+
+        <!-- Создание списка из шапки: иконка «+» + текст на градиенте
+             кристалла; тач-таргет ≥48dp (minHeight из стиля).
+             Wiring (задача 18): диалог имени → POST /shopping/lists →
+             refresh; отключать при NO_CONNECTION. -->
+        <Button
+            android:id="@+id/create_list_top"
+            style="@style/Widget.Gemma.Button.Filled.Compact"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:contentDescription="Создать список"
+            android:drawableStart="@drawable/ic_add"
+            android:drawablePadding="6dp"
+            android:text="Создать список" />
+    </LinearLayout>
+
+    <!-- Загрузка -->
+    <ProgressBar
+        android:id="@+id/pbLoading"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="8dp"
+        android:visibility="gone" />
+
+    <!-- Нижняя зона: список и/или статус с empty-state CTA.
+         Статус (tvStatus) руководство Kotlin через showStatus/hideStatus —
+         id и видимость управляются кодом, layout только центрирует. -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1">
+
+        <!-- Список списков: прозрачный разделитель с высотой = зазор между
+             карточками-строками (layout_margin у корня строки в ListView
+             не гарантирован, зазор делаем divider'ом) -->
+        <ListView
+            android:id="@+id/lvLists"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:divider="#00000000"
+            android:dividerHeight="8dp"
+            android:listSelector="?attr/selectableItemBackground"
+            android:paddingBottom="8dp"
+            android:visibility="gone" />
+
+        <!-- Центральный блок: статус состояния + CTA empty-state.
+             Блок сам по себе небольшой (wrap) и центрируется во фрейме;
+             когда оба ребёнка gone — блока на экране не видно. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:textColor="@color/status_idle"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <!-- CTA пустого экрана: крупная кнопка по центру; wiring
+                 (задача 18): VISIBLE только в ScreenState.EMPTY
+                 (в showStatus/hideStatus — GONE), действие то же, что у
+                 create_list_top. -->
+            <Button
+                android:id="@+id/create_empty"
+                style="@style/Widget.Gemma.Button.Filled"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:contentDescription="Создать список"
+                android:drawableStart="@drawable/ic_add"
+                android:drawablePadding="8dp"
+                android:minHeight="48dp"
+                android:minWidth="0dp"
+                android:paddingStart="24dp"
+                android:paddingEnd="32dp"
+                android:text="Создать список"
+                android:textSize="15sp"
+                android:visibility="gone" />
+        </LinearLayout>
+    </FrameLayout>
+</LinearLayout>

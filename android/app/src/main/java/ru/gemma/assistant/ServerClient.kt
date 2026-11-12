@@ -1,12 +1,21 @@
 package ru.gemma.assistant
 
+import kotlinx.coroutines.CancellationException
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.URLEncoder
 import java.net.URL
+import java.util.concurrent.TimeUnit
 
 /**
- * Клиент API ассистента (сервер на ПК).
+ * Клиент API ассистента (сервер на ПК): REST `/health`, `/ask`, `/voice`,
+ * `/tts`, `/confirm`, `/profile`, `/cert` и CRUD списков покупок
+ * `/shopping/…` (короткий таймаут, единый результат [ShoppingRes]).
  *
  * Два транспорта (план «гибридный туннель»):
  *  - [TunnelTransport] -- канал `wss://<ddns>:8443/tunnel`, когда он
@@ -22,7 +31,23 @@ object ServerClient {
 
     private const val CONNECT_TIMEOUT = 10_000
     private const val READ_TIMEOUT = 120_000 // поиск + LLM могут быть долгими
+    // CRUD списков покупок: общий READ_TIMEOUT (120 с, под LLM) не подходит —
+    // экран ждёт ответ ≤10 с, дальше — NO_CONNECTION
+    private const val SHOPPING_TIMEOUT = 10_000
     private const val TAG = "ServerClient"
+
+    /**
+     * LAN-клиент для PATCH (один на процесс, по образцу VoiceStream):
+     * `HttpURLConnection.setRequestMethod("PATCH")` на Android (AOSP)
+     * бросает `ProtocolException` — белый список методов не включает PATCH.
+     */
+    private val lanClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(SHOPPING_TIMEOUT.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(SHOPPING_TIMEOUT.toLong(), TimeUnit.MILLISECONDS)
+            .writeTimeout(SHOPPING_TIMEOUT.toLong(), TimeUnit.MILLISECONDS)
+            .build()
+    }
 
     /**
      * Последний выбранный транспорт — чтобы в канал логов писать только
@@ -141,6 +166,70 @@ object ServerClient {
     ): HttpRes = DirectTransport(server).execute(
         "GET", path, authHeaders(), null, timeoutMs.toInt(), timeoutMs.toInt())
 
+    /**
+     * Вызов shopping-CRUD: короткий таймаут [SHOPPING_TIMEOUT] (не общий
+     * READ_TIMEOUT), тело уже разобрано в [ShoppingRes] — Activity не парсит
+     * raw. Любая сетевая ошибка/таймаут → `ShoppingRes(code = 0)` (на экране
+     * — NO_CONNECTION) + строка `AppLog.w` в канал логов (diff'ить «нет
+     * связи» в smoke S9); отмена корутины НЕ глотается (rethrow), `Error`
+     * не глотается (ловим только Exception).
+     *
+     * PATCH: `HttpURLConnection` (AOSP) не знает метод PATCH
+     * (`ProtocolException: Invalid HTTP method: PATCH`) — по LAN идёт через
+     * OkHttp [patchLan]; через канал туннеля — штатный `call()` (туннель
+     * проксирует метод как есть). LAN-PATCH проверяется в smoke S9.
+     */
+    private fun shoppingCall(
+        server: String,
+        method: String,
+        path: String,
+        body: ByteArray? = null,
+        contentType: String? = null,
+        parse: (HttpRes) -> ShoppingRes,
+    ): ShoppingRes = try {
+        val res = if (method == "PATCH" && !TunnelClient.isOpen()) {
+            patchLan(server, path, body, contentType)
+        } else {
+            call(
+                server, method, path,
+                body = body, contentType = contentType,
+                readTimeoutMs = SHOPPING_TIMEOUT,
+            )
+        }
+        parse(res)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        AppLog.w(TAG, "shopping $method $path -> $e")
+        ShoppingRes(code = ShoppingRes.NET_ERROR)
+    }
+
+    /**
+     * PATCH по LAN через OkHttp 4.12.0 (`implementation("com.squareup.okhttp3:
+     * okhttp:4.12.0")` уже в проекте — TunnelClient/VoiceStream; новых
+     * зависимостей нет): рефлексия приватного поля `method` у
+     * HttpURLConnection отклонена как хрупкая. Таймауты — [SHOPPING_TIMEOUT],
+     * заголовки — те же, что в `call()` (включая `X-Gemma-Token`).
+     */
+    private fun patchLan(
+        server: String,
+        path: String,
+        body: ByteArray?,
+        contentType: String?,
+    ): HttpRes {
+        noteTransport("lan")
+        val req = Request.Builder()
+            .url("${server.trimEnd('/')}$path")
+            .apply { for ((k, v) in authHeaders()) header(k, v) }
+            .patch((body ?: ByteArray(0)).toRequestBody(contentType?.toMediaTypeOrNull()))
+            .build()
+        return lanClient.newCall(req).execute().use { resp ->
+            val ct = resp.body?.contentType()?.toString()
+            val bytes = resp.body?.bytes() ?: ByteArray(0)
+            HttpRes(resp.code, bytes, ct)
+        }
+    }
+
     // ------------------------------------------------------------------
     // Публичные вызовы API
     // ------------------------------------------------------------------
@@ -209,6 +298,81 @@ object ServerClient {
         return readJson(call(server, "POST", "/profile", body = body,
                              contentType = "application/json"))
     }
+
+    // ------------------------------------------------------------------
+    // Списки покупок: REST /shopping/* (фича «Списки покупок», задача 6;
+    // создание из UI — задача 18)
+    // ------------------------------------------------------------------
+
+    /**
+     * GET /shopping/lists -> `{"lists": [...]}`, разбор в [parseLists]
+     * (битый JSON → пусто, без краша). Состояние экрана — [ScreenState].
+     */
+    fun shoppingLists(server: String): ShoppingRes =
+        shoppingCall(server, "GET", "/shopping/lists") { res ->
+            ShoppingRes(res.code, lists = parseLists(String(res.body, Charsets.UTF_8)))
+        }
+
+    /** GET /shopping/lists/{id} -> объект списка; 404 — неизвестный id. */
+    fun shoppingList(server: String, id: String): ShoppingRes =
+        shoppingCall(server, "GET", "/shopping/lists/${encId(id)}") { res ->
+            ShoppingRes(res.code, list = parseList(String(res.body, Charsets.UTF_8)))
+        }
+
+    /**
+     * POST /shopping/lists: создать список покупок (создание из UI,
+     * задача 18). [name] — текст поля диалога: тело собирает [createBody]
+     * (`{"name": …}`; пустое/null после трима — поле не отправляется,
+     * сервер ставит дефолт «Список покупок», семантика голосовой ветки).
+     *
+     * **Контракт состояний** — как у [patchShopping]: успех определяется по
+     * `res.ok` (2xx), А НЕ по наличию `list`; тело ответа — созданный объект
+     * `{id, name, items, created_at, updated_at}` → [parseList]. 2xx без
+     * разобранного `list` — успех без id (Activity перечитывает
+     * [shoppingLists] вместо перехода в детали).
+     */
+    fun createShopping(server: String, name: String?): ShoppingRes =
+        shoppingCall(
+            server, "POST", "/shopping/lists",
+            body = createBody(name).toByteArray(Charsets.UTF_8),
+            contentType = "application/json",
+        ) { res ->
+            ShoppingRes(res.code, list = parseList(String(res.body, Charsets.UTF_8)))
+        }
+
+    /**
+     * PATCH /shopping/lists/{id}: [body] — JSON вида `{"items":[...]}` из
+     * [patchBody] (полная замена массива). 400 — битое тело, 413 — >64 КБ.
+     *
+     * **Контракт состояний**: успех определяется по `res.ok` (2xx), А НЕ по
+     * наличию `list` — тело 200 может отсутствовать/не разобраться. После
+     * успеха — рефетч [shoppingList], состояние экрана — по
+     * `screenState(res.code, ...)`.
+     */
+    fun patchShopping(server: String, id: String, body: String): ShoppingRes =
+        shoppingCall(
+            server, "PATCH", "/shopping/lists/${encId(id)}",
+            body = body.toByteArray(Charsets.UTF_8),
+            contentType = "application/json",
+        ) { res ->
+            ShoppingRes(res.code, list = parseList(String(res.body, Charsets.UTF_8)))
+        }
+
+    /**
+     * DELETE /shopping/lists/{id} -> 200/204; 404 — неизвестный id.
+     *
+     * **Контракт состояний**: успех — по `res.ok` (payload не возвращается):
+     * 2xx — удалён (дальше рефетч [shoppingLists]), 404 — не найден,
+     * иначе — NO_CONNECTION.
+     */
+    fun deleteShopping(server: String, id: String): ShoppingRes =
+        shoppingCall(server, "DELETE", "/shopping/lists/${encId(id)}") { res ->
+            ShoppingRes(res.code)
+        }
+
+    /** URL-энкодинг id в path-сегмент (server-generated id не меняется). */
+    private fun encId(id: String): String =
+        URLEncoder.encode(id, "UTF-8").replace("+", "%20")
 
     private fun readJson(res: HttpRes): JSONObject {
         if (res.code !in 200..299) {

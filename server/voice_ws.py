@@ -32,11 +32,13 @@ router = APIRouter()
 #                      {"event":"hear","text":...}  -- сегмент распознан
 #                                                      НА ЛЕТУ (stt идёт
 #                                                      параллельно речи);
-#                      {"event":"sentence","text":..}-- предложение ответа
-#                                                      (фаза 6, стриминг);
-#                      {"event":"audio","b64":...}  -- WAV-чанк ответа
-#                                                      (по мере готовности
-#                                                      предложений);
+#                      {"event":"sentence","text":..}-- финальная реплика
+#                                                      (задача 16: mid-stream
+#                                                      предложения модели
+#                                                      НЕ озвучиваются);
+#                      {"event":"audio","b64":...}  -- WAV финальной реплики
+#                                                      (sentence+audio всегда
+#                                                      РАНЬШЕ reply-event);
 #                      {"event":"reply","reply":...,"streamed":bool}
 #                                                     -- итог: reply целиком
 #                                                      + confirm/token;
@@ -401,25 +403,35 @@ async def ws_voice(ws: WebSocket) -> None:
                  " ".join(heard), text)
 
         if not text:
+            # Единообразие схемы: все reply-события несут confirm/streamed
+            # (телефон дефолтит, но явные false -- документация факта:
+            # озвучки не было, финальную фразу скажет локальный TTS).
             await ws.send_json(
                 {"event": "reply",
-                 "reply": "Не расслышал, повтори, пожалуйста."})
+                 "reply": "Не расслышал, повтори, пожалуйста.",
+                 "confirm": False, "streamed": False})
             await ws.send_json({"event": "done"})
             return
 
-        # ---------------- стриминговый ответ (фаза 6, п. 1) ----------
-        # Предложения reply из llama-стрима -> TTS -> аудио-чанки клиенту
-        # по мере готовности (первый звук ~1-1.5 с вместо 4-9 с).
+        # ---------------- ответ (фаза 6, п. 1; гейт задачи 16) --------
+        # Модель стримит предложения через on_sentence ПОКА решение ещё
+        # не готово: живьём телефон слышал «болтовню» модели («Ага,
+        # создал! ... Готово, держи!»), а после решения dispatch досыпал
+        # шаблон-фолбэк («Список «Вкусняшки» не найден») -- двойная
+        # озвучка с противоречивым текстом (phone.log 23:00:58-23:01:08).
+        # Структурный гейт (задача 16): стрим ГЛОТАЕТСЯ -- on_sentence
+        # остаётся (иначе answer ушёл бы в блокирующий decide() без
+        # first_token и спекулятивного prefetch поиска), но в TTS эти
+        # предложения НЕ идут. Озвучивается РОВНО ОДНА реплика --
+        # финальный reply (шаблон dispatch / вопрос-подтверждение /
+        # ответ модели), всегда ПОСЛЕ готовности решения.
         loop = asyncio.get_running_loop()
-        sent_q: asyncio.Queue[str | None] = asyncio.Queue()
         t_ask = time.perf_counter()
         first_ms: list[int] = []
         tts_first_ms: list[int] = []
-        chunks_sent = 0
 
-        def _on_sentence(s: str) -> None:
-            # llama-стрим -- блокирующий поток -> в очередь event loop
-            loop.call_soon_threadsafe(sent_q.put_nowait, s)
+        def _on_sentence(_s: str) -> None:
+            pass  # pre-decision chatter в TTS-канал не уходит (задача 16)
 
         def _on_first_token() -> None:
             first_ms.append(int((time.perf_counter() - t_ask) * 1000))
@@ -429,66 +441,40 @@ async def ws_voice(ws: WebSocket) -> None:
             # ещё дописывает ответ
             asyncio.run_coroutine_threadsafe(_prefetch_search(q), loop)
 
-        async def _speak_stream() -> int:
-            """TTS предложений по мере генерации -> аудио-чанки клиенту."""
-            sent = 0
-            voice = llm.get_profile_voice()
-            while True:
-                s = await sent_q.get()
-                if s is None:
-                    return sent
-                try:
-                    wav = await asyncio.to_thread(tts_mod.synthesize, s, voice)
-                except Exception:
-                    log.warning("ws_voice: tts(sentence) failed", exc_info=True)
-                    continue
-                if not wav:
-                    continue
-                if not tts_first_ms:
-                    tts_first_ms.append(int((time.perf_counter() - t_ask)
-                                            * 1000))
-                sent += 1
-                try:
-                    await ws.send_json({"event": "sentence", "text": s})
-                    await ws.send_json(
-                        {"event": "audio",
-                         "b64": base64.b64encode(wav).decode("ascii")})
-                except Exception:  # noqa: BLE001 -- клиент ушёл
-                    return sent
+        resp = await _answer(text, on_sentence=_on_sentence,
+                             on_first_token=_on_first_token,
+                             on_query=_on_query)
 
-        speak_task = asyncio.create_task(_speak_stream())
+        # Единственная озвучка -- финальная реплика: sentence + audio
+        # ДО reply-события (инвариант задач 14/16: телефон играет
+        # аудио-чанки по приходу и НЕ повторяет reply при
+        # streamed=true). Confirm-ворота needs_confirm/reply_replaced
+        # больше не разделяют ветки: reply уже финальный. Текст уже
+        # чист от мата: санитайзер задачи 21 в answer._answer (общий
+        # путь этого ws-endpoint); /confirm чистится явными вызовами
+        # sanitize_reply в server.py.
+        chunks_sent = 0
         try:
-            resp = await _answer(text, on_sentence=_on_sentence,
-                                 on_first_token=_on_first_token,
-                                 on_query=_on_query)
-        finally:
-            await sent_q.put(None)          # конец потока предложений
-        chunks_sent = await speak_task
-
-        # needs_confirm (поиск/отправка/звонок): финальная реплика-вопрос
-        # («Скажи да...») -- её streamed-чанками НЕ передавали (стрим шёл
-        # от имени модели, до _dispatch) -> озвучиваем сейчас.
-        if resp.needs_confirm:
-            try:
-                wav = await asyncio.to_thread(tts_mod.synthesize, resp.reply,
-                                              llm.get_profile_voice())
-            except Exception:
-                log.warning("ws_voice: tts(confirm) failed", exc_info=True)
-                wav = b""
-            if wav:
-                if not tts_first_ms:
-                    tts_first_ms.append(int((time.perf_counter() - t_ask)
-                                            * 1000))
-                chunks_sent += 1
-                await ws.send_json({"event": "sentence", "text": resp.reply})
-                await ws.send_json(
-                    {"event": "audio",
-                     "b64": base64.b64encode(wav).decode("ascii")})
+            wav = await asyncio.to_thread(tts_mod.synthesize, resp.reply,
+                                          llm.get_profile_voice())
+        except Exception:
+            log.warning("ws_voice: tts(final reply) failed", exc_info=True)
+            wav = b""
+        if wav:
+            if not tts_first_ms:
+                tts_first_ms.append(int((time.perf_counter() - t_ask)
+                                        * 1000))
+            chunks_sent += 1
+            await ws.send_json({"event": "sentence", "text": resp.reply})
+            await ws.send_json(
+                {"event": "audio",
+                 "b64": base64.b64encode(wav).decode("ascii")})
 
         # confirm/token -- телефону нужно для перехода в State.CONFIRM
         # (как в POST /voice; без них ломалось подтверждение поиска/отправки)
-        # streamed=True: аудио-чанки уже ушли -- телефон НЕ озвучивает
-        # reply повторно (иначе двойная речь).
+        # streamed=True: аудио финальной реплики уже ушло -- телефон НЕ
+        # озвучивает reply повторно (иначе двойная речь). При упавшем
+        # TTS streamed=False -- финальный reply скажет локальный TTS.
         await ws.send_json({"event": "reply", "reply": resp.reply,
                             "confirm": resp.needs_confirm,
                             "token": resp.token,

@@ -27,7 +27,9 @@ _HISTORY_LOCK = state.history_lock
 # --------------------------------------------------------------------------
 @dataclass
 class Pending:
-    action: Literal["send_tg", "send_vk", "search", "call"]
+    # shopping_delete — списки покупок (задача 3): удаление списка только
+    # через подтверждение /confirm (как call); прочие значения не менялись.
+    action: Literal["send_tg", "send_vk", "search", "call", "shopping_delete"]
     args: dict[str, Any]
     reply: str          # что спросили у пользователя
     expires: float = field(default_factory=lambda: time.time() + settings.confirm_ttl)

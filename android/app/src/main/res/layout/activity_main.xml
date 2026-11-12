@@ -45,6 +45,22 @@
                 android:layout_height="1dp"
                 android:layout_weight="1" />
 
+            <!-- Списки покупок: вход в UI-списки (по образцу шестерёнки —
+                 текст-баттон, новых drawable не нужно) -->
+            <TextView
+                android:id="@+id/btnShoppingLists"
+                android:layout_width="wrap_content"
+                android:layout_height="44dp"
+                android:layout_marginEnd="4dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Списки покупок"
+                android:gravity="center"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:text="Списки"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
             <!-- Меню настроек: адрес сервера, DDNS, токен, пин -->
             <ImageButton
                 android:id="@+id/btnSettings"

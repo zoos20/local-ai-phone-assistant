@@ -47,6 +47,14 @@ class AppState:
     # "" до первого импорта llm.profiles: тот кладёт сюда _load_profile().
     profile: str = ""
 
+    # --- списки покупок (shopping_store, фича «Списки покупок») ---
+    # Данные живут на диске (data/shopping_lists.json), здесь -- только общий
+    # лок read-modify-write-операций (один процесс -- один лок: голос и REST)
+    # и активный список (решение 2 плана). Инстанс стора в AppState НЕ
+    # хранится -- иначе циклический импорт app_state <-> shopping_store.
+    shopping_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active_list_id: str | None = None
+
     @property
     def tg_client(self) -> Any:
         """Ленивый клиент Telethon (tools._tg_client).

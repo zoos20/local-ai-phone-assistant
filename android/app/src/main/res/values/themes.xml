@@ -31,4 +31,27 @@
         <item name="android:backgroundTint">@null</item>
         <item name="android:textColor">@android:color/white</item>
     </style>
+
+    <!-- Компактная градиентная кнопка для шапки («Создать список»):
+         та же заливка кристалла, поменьше текст, тач-таргет ≥48dp -->
+    <style name="Widget.Gemma.Button.Filled.Compact" parent="Widget.Gemma.Button.Filled">
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:paddingStart">14dp</item>
+        <item name="android:paddingEnd">16dp</item>
+    </style>
+
+    <!-- Тихое текстовое действие шапки («Обновить») — тот же приём, что у
+         кнопки «Списки» в шапке главного экрана: borderless, без фона,
+         второстепенное действие не спорит с градиентной CTA -->
+    <style name="Widget.Gemma.TextAction" parent="Widget.Gemma.Button">
+        <item name="android:background">?attr/selectableItemBackgroundBorderless</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:paddingStart">10dp</item>
+        <item name="android:paddingEnd">10dp</item>
+    </style>
 </resources>

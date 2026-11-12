@@ -182,8 +182,9 @@ class VoiceStream(
         if (h != null) h.sendText(text) else ws?.send(text)
     }
 
-    // Сервер шлёт reply, ПОТОМ audio (синтез), потом done: события Reply
-    // откладываем до done, иначе wav не успевает прийти (фикс гонки 29.10).
+    // С задачи 16 (§3.2) сервер отдаёт audio (досинтез) РАНЬШЕ reply, затем
+    // done: чанки играются сразу, а Reply откладываем до done — ответ один
+    // раз, уже после аудио.
     private var pendReply: JSONObject? = null
     private var pendAudio: ByteArray? = null
 

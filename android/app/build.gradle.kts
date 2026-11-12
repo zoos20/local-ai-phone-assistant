@@ -11,8 +11,8 @@ android {
         applicationId = "ru.gemma.assistant"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     buildTypes {
@@ -49,7 +49,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     // WebSocket-стриминг аудио на сервер во время речи (фаза 6, п. 1)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // Характеризационные юнит-тесты (распознавание, фонетика, RMS, wake)
     testImplementation("junit:junit:4.13.2")
     // org.json в unit-тестах: android.jar замокан, нужна реальная реализация
     // для Updater.parseManifest (штатный workaround)
