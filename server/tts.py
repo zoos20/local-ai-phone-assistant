@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Озвучка: Piper (офлайн-нейро-TTS, русский голос irina).
+"""Озвучка: sidecar silero v5_6_ru (прод, порт 8092) / kokoro-ru (порт
+8091, ветка-страховка) -> фолбэк Piper (офлайн-нейро-TTS).
 
-Голос лежит в models/ru_RU-irina-medium.onnx. Синтез в WAV 16 бит.
-Модель грузится лениво.
+Выбор движка -- settings.tts_engine ("silero" | "kokoro"); при падении
+активного sidecar'а синтез уходит на Piper (голос из models/*.onnx,
+напр. ru_RU-irina-medium.onnx). Синтез в WAV 16 бит; Piper-модель
+грузится лениво.
 """
 from __future__ import annotations
 
@@ -29,18 +32,34 @@ log = logging.getLogger("assistant.tts")
 _KOKORO_LOG_INTERVAL = 60.0
 _kokoro_last_full_log = 0.0
 
+# То же для silero -- зеркало (полный стек не чаще раза в 60 с).
+_SILERO_LOG_INTERVAL = 60.0
+_silero_last_full_log = 0.0
+
+# Sidecar silero v5_6_ru (tts_silero_server.py, порт 8092).
+_SILERO_URL = "http://127.0.0.1:8092/synth"
+
 _voice = None
 _lock = threading.Lock()
 
 BASE_DIR = Path(__file__).resolve().parent
 
 # Связка «профиль <-> голос» (план): у профиля поле voice = id голоса
-# kokoro-ru (sveta/masha/dima). Фолбэк на piper, если kokoro упал:
-# женские sveta/masha -> irina, мужской dima -> denis.
+# kokoro-ru (sveta/masha/dima), поле voice_silero = silero-голос
+# (eugene/aidar/xenia/baya/kseniya -- llm/profiles.py). Фолбэк на piper,
+# если активный sidecar упал: silero-голоса фолбэкаются по полу
+# (eugene/aidar -- муж -> denis, xenia/baya/kseniya -- жен -> irina);
+# kokoro-голоса: женские sveta/masha -> irina, мужской dima -> denis.
 _PIPER_BY_VOICE = {
     "sveta": "ru_RU-irina-medium",
     "masha": "ru_RU-irina-medium",
     "dima": "ru_RU-denis-medium",
+    # silero v5_6_ru (прод) -- фолбэк по полу:
+    "eugene": "ru_RU-denis-medium",   # муж
+    "aidar": "ru_RU-denis-medium",    # муж
+    "xenia": "ru_RU-irina-medium",    # жен
+    "baya": "ru_RU-irina-medium",     # жен
+    "kseniya": "ru_RU-irina-medium",  # жен
 }
 
 
@@ -87,12 +106,38 @@ def _synthesize_kokoro(text: str, voice: str = "") -> bytes:
     return data
 
 
+def _synthesize_silero(text: str, voice: str = "") -> bytes:
+    """Отправляет текст на silero v5_6_ru sidecar (порт 8092) -> WAV-байты.
+
+    Sidecar живёт отдельным процессом в .venv-tts (torch CPU), модель
+    v5_6_ru загружена и прогрета заранее (5 голосов, 48 кГц; числа
+    нормализует ru-normalizr внутри sidecar). voice -- голос из профиля
+    (связка «профиль <-> голос»); пустой -> дефолтный sidecar'а
+    (eugene). Ошибки пробрасываются -- вызывающий решает, фолбэчить ли
+    на piper.
+    """
+    payload: dict[str, str] = {"text": text}
+    if voice:
+        payload["voice"] = voice
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        _SILERO_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = resp.read()
+    if not data.startswith(b"RIFF"):
+        raise RuntimeError("silero sidecar вернул не WAV")
+    return data
+
+
 def synthesize(text: str, voice: str | None = None) -> bytes:
     """Текст -> WAV-байты (частота модели). Пустой текст -> b"".
 
-    voice -- голос kokoro-ru из профиля (связка «профиль <-> голос»);
-    None -> дефолтный. При падении kokoro -- фолбэк на piper (женские
-    голоса -> irina, мужской dima -> denis).
+    voice -- голос из профиля по текущему движку (связка «профиль <->
+    голос»; silero: eugene/aidar/xenia/baya/kseniya, kokoro:
+    sveta/masha/dima); None -> дефолтный. При падении активного
+    sidecar -- фолбэк на piper (silero-голоса по полу, kokoro: женские
+    -> irina, мужской dima -> denis).
     """
     cleaned = normalize_for_speech(clean_for_speech(text))
     if not cleaned and (text or "").strip():
@@ -105,6 +150,20 @@ def synthesize(text: str, voice: str | None = None) -> bytes:
     text = cleaned
     if not text:
         return b""
+
+    if settings.tts_engine == "silero":
+        try:
+            return _synthesize_silero(text, voice or "")
+        except Exception as exc:
+            # фолбэк на piper: ассистент не должен замолкнуть из-за TTS
+            global _silero_last_full_log
+            now = time.monotonic()
+            if now - _silero_last_full_log >= _SILERO_LOG_INTERVAL:
+                _silero_last_full_log = now
+                log.exception("silero недоступен (запущен start-silero.ps1?), "
+                              "фолбэк на piper")
+            else:
+                log.warning("silero недоступен, фолбэк на piper: %r", exc)
 
     if settings.tts_engine == "kokoro":
         try:

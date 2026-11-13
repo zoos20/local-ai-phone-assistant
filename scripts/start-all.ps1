@@ -5,7 +5,9 @@
     Starts the whole stack, idempotently:
       1. llama-server (LLM) on port 8080        -> $LlamaStart (see below)
       2. assistant API (FastAPI) on port 8090   -> <project>\server\server.py
-      3. tunnel (wss, TLS + token) on port 8443 -> <project>\server\tunnel.py
+      3. silero TTS sidecar on port 8092        -> <project>\server\tts_silero_server.py
+                                                   (.venv-tts, mirror of stop-all.ps1)
+      4. tunnel (wss, TLS + token) on port 8443 -> <project>\server\tunnel.py
 
     Layout: python code + .venv + .env live in <project>\server\,
     this script lives in <project>\scripts\.
@@ -13,6 +15,12 @@
     "Stop the server" in this project means stopping ALL of them, so the
     autostart brings ALL back. Each one is skipped when its health check
     already answers, so re-running the script (or logging on twice) is harmless.
+
+    NOTE: the kokoro-ru TTS sidecar (8091) is deliberately NOT in the
+    autostart anymore (12.11.2026, prod TTS switched to silero v5_6_ru):
+    kokoro eats ~0.9 GB RAM vs ~0.25 GB for silero. The tts_engine="kokoro"
+    branch stays as a fallback; start the kokoro sidecar manually with
+    scripts\start-kokoro.ps1 when needed (stop-all.ps1 still stops it).
 
     NOTE: if 127.0.0.1:8080 is owned by another local service, the model
     health check must go through the LAN IP (same rule as switch-model.ps1).
@@ -91,7 +99,31 @@ if (Test-Health 'http://127.0.0.1:8090/health') {
     Write-Host "[autostart] $Python not found -- API NOT started"
 }
 
-# --- 3. tunnel (wss 8443) -------------------------------------------------
+# --- 3. silero TTS sidecar (8092) ------------------------------------------
+# Health: GET /health -> {"status":"ok"} (same matcher as the API check).
+# The sidecar loads the voice model BEFORE binding the port (warmup ~15 s),
+# so a bare TCP/port check would race a still-warming instance and start a
+# duplicate: also skip when a python process already runs
+# tts_silero_server.py (same detection as stop-all.ps1).
+$TtsPython  = Join-Path $ServerDir '.venv-tts\Scripts\python.exe'
+$sileroBusy = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -eq 'python.exe' -and $_.CommandLine -match 'tts_silero_server\.py'
+    }
+if (Test-Health 'http://127.0.0.1:8092/health') {
+    Write-Host "[autostart] silero TTS already healthy on 8092 -- skip"
+} elseif ($sileroBusy) {
+    Write-Host "[autostart] silero TTS process already running (warming up) -- skip"
+} elseif (Test-Path $TtsPython) {
+    Write-Host "[autostart] starting silero TTS sidecar (warmup ~15 s)..."
+    Start-Process -FilePath $TtsPython `
+        -ArgumentList 'tts_silero_server.py' -WorkingDirectory $ServerDir `
+        -WindowStyle Hidden | Out-Null
+} else {
+    Write-Host "[autostart] $TtsPython not found -- TTS NOT started (voice falls back to piper)"
+}
+
+# --- 4. tunnel (wss 8443) -------------------------------------------------
 # Health check is a bare TCP connect to 8443 (the TLS handshake needs a
 # client cert check we cannot do from here). Started only when its port is
 # free; requires ASSISTANT_API_TOKEN in server\.env, otherwise it rejects

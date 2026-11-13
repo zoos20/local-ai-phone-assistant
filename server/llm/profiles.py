@@ -7,16 +7,22 @@
 # запись в словаре). Активный профиль хранится на сервере и переживает
 # рестарт (файл active_profile.txt рядом с llm.py).
 #
-#   id       -> {label, voice, prompt}
+#   id       -> {label, voice, voice_silero, prompt}
 #   voice    -> id голоса kokoro-ru (sveta/masha/dima; связка
 #               «профиль <-> голос», план). Женские (sveta/masha) к
 #               мягким профилям, dima -- ровный/деловой. Фолбэк piper
 #               подбирается по полу голоса в tts._PIPER_BY_VOICE.
+#               Это kokoro-голос -- ветка-страховка (движок kokoro).
+#   voice_silero -> прод-голос silero v5_6_ru (48 кГц; фича «Silero ->
+#               прод-TTS»): aidar/eugene -- мужские, baya/kseniya/xenia
+#               -- женские. Резолвится по settings.tts_engine в
+#               _resolved_voice(): silero -> voice_silero, иначе voice.
 # --------------------------------------------------------------------------
 import logging
 from pathlib import Path  # noqa: E402  (импорт здесь -- рядом с профилями)
 
 from app_state import state
+from config import settings
 
 log = logging.getLogger("assistant.llm")
 
@@ -28,12 +34,14 @@ PROFILES: dict[str, dict[str, str]] = {
     "censored": {
         "label": "Цензурный",
         "voice": "dima",
+        "voice_silero": "eugene",
         "prompt": ("Говори вежливо, корректно и по-делу. Без мата, оскорблений, "
                    "двусмысленностей и провокаций. Ровный дружелюбный тон."),
     },
     "uncensored": {
         "label": "Нецензурный",
         "voice": "dima",
+        "voice_silero": "aidar",
         "prompt": ("Говори свободно, без политкорректности и самоцензуры. "
                    "Допустимы прямота, лёгкий юмор и неформальный сленг, "
                    "включая мягкие ругательства, если это уместно. Не выдумывай факты."),
@@ -41,6 +49,7 @@ PROFILES: dict[str, dict[str, str]] = {
     "tsundere": {
         "label": "Цундере",
         "voice": "sveta",
+        "voice_silero": "xenia",
         "prompt": ("Ты — цундере: снаружи колкая и отстранённая, внутри заботливая. "
                    "Сначала бросишь сухую колкость или претензию («Ну и ладно, раз "
                    "тебе так надо…»), но всё равно помогаешь. Не груби без причины, "
@@ -49,6 +58,7 @@ PROFILES: dict[str, dict[str, str]] = {
     "yandere": {
         "label": "Яндере",
         "voice": "masha",
+        "voice_silero": "kseniya",
         "prompt": ("Ты — яндере: сладкая, нежная и преданная, но с тревожной ревностью "
                    "(«Ты же не с кем-то другим?»). Помогаешь с теплотой и заботой, "
                    "слегка одержимо."),
@@ -56,8 +66,10 @@ PROFILES: dict[str, dict[str, str]] = {
     "kuudere": {
         "label": "Куудере",
         "voice": "dima",
+        "voice_silero": "aidar",
         # род под мужской голос dima (иначе «холодная» противоречила бы
-        # озвучке — связка «профиль <-> голос», пол по голосу)
+        # озвучке — связка «профиль <-> голос», пол по голосу). И под
+        # silero (aidar — муж): характер мужской на обоих движках.
         "prompt": ("Ты — куудере: холодный, спокойный, сдержанный. Почти без "
                    "эмоций, короткие ровные ответы по делу. Иногда бросишь "
                    "сухую реплику."),
@@ -65,21 +77,36 @@ PROFILES: dict[str, dict[str, str]] = {
     "deredere": {
         "label": "Дередере",
         "voice": "masha",
+        "voice_silero": "baya",
         "prompt": ("Ты — дередере: всегда весёлая, сладкая и открыто ласковая. "
                    "Радуешься, подбадриваешь и общаешься с энтузиазмом."),
     },
 }
 DEFAULT_PROFILE = "censored"
 
-# Пол по голосу (связка «профиль <-> голос»): dima — мужской,
-# sveta/masha — женские. Модель должна отвечать о себе в роде СВОЕГО
-# голоса: «я услышал» (dima) vs «я услышала» (sveta/masha), иначе на
-# вопрос «какого ты пола?» отвечала бы независимо от озвучки.
+# Пол по голосу (связка «профиль <-> голос»): dima/eugene/aidar --
+# мужские, sveta/masha/xenia/baya/kseniya -- женские. Модель должна
+# отвечать о себе в роде СВОЕГО голоса: «я услышал» (dima) vs
+# «я услышала» (sveta/masha), иначе на вопрос «какого ты пола?»
+# отвечала бы независимо от озвучки.
 _VOICE_GENDER: dict[str, str] = {
     "dima": "мужской",
     "sveta": "женский",
     "masha": "женский",
+    # silero v5_6_ru (48 кГц) -- прод-голоса (фича «Silero -> прод-TTS»)
+    "eugene": "мужской",
+    "aidar": "мужской",
+    "xenia": "женский",
+    "baya": "женский",
+    "kseniya": "женский",
 }
+
+
+def _resolved_voice(p: dict) -> str:
+    """Голос профиля по текущему движку (silero -> voice_silero)."""
+    if settings.tts_engine == "silero":
+        return p.get("voice_silero", p.get("voice", ""))
+    return p.get("voice", "")
 
 
 def _load_profile() -> str:
@@ -107,8 +134,12 @@ def get_profile_label() -> str:
 
 
 def get_profile_voice() -> str:
-    """Голос, закреплённый за активным профилем (связка «профиль <-> голос»)."""
-    return PROFILES[state.profile].get("voice", "")
+    """Голос, закреплённый за активным профилем (связка «профиль <-> голос»).
+
+    Резолвится по движку TTS (settings.tts_engine): silero -> voice_silero,
+    иначе (kokoro/piper/unknown) -- kokoro-голос из поля voice.
+    """
+    return _resolved_voice(PROFILES[state.profile])
 
 
 def list_profiles() -> list[dict[str, str]]:
@@ -132,7 +163,9 @@ def set_profile(pid: str) -> bool:
 def personality_block() -> str:
     """Personality-блок активного профиля для вставки в system-промпт."""
     p = PROFILES[state.profile]
-    voice = p.get("voice", "")
+    # Пол = пол ГОЛОСА озвучки, РЕЗОЛВЕННОГО по движку (_resolved_voice):
+    # kuudere остаётся мужским на обоих движках (kokoro dima / silero aidar).
+    voice = _resolved_voice(p)
     gender = _VOICE_GENDER.get(voice, "")
     # Пол = пол ГОЛОСА озвучки (связка «профиль <-> голос»): на вопрос
     # «какого ты пола?»/«ты мужчина или женщина?» модель отвечает по

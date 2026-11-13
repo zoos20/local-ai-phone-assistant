@@ -37,10 +37,14 @@ class Settings(BaseSettings):
     whisper_model: str = "small"
     # Голос Piper из models/ (ru_RU-irina-medium | ru_RU-ruslan-medium ...)
     tts_voice: str = "ru_RU-denis-medium"
-    # Движок озвучки (фаза 7, п.4, выбор 30.10 — kokoro-ru):
-    # kokoro — sidecar tts_kokoro_server.py (порт 8091, torch CPU, голос dima),
-    # piper — прежний офлайн. При падении kokoro — фолбэк на piper.
-    tts_engine: str = "kokoro"
+    # Движок озвучки (выбор 12.11.2026 по A/B-харнессу + слепой
+    # прослушке): silero -- sidecar tts_silero_server.py (порт 8092,
+    # torch CPU, 5 голосов v5_6_ru, 48 кГц, числа нормализует
+    # ru-normalizr внутри sidecar); kokoro -- прежний sidecar
+    # tts_kokoro_server.py (порт 8091), ветка-страховка, поднимается
+    # scripts/start-kokoro.ps1 вручную; piper -- прежний офлайн-фолбэк.
+    # При падении активного sidecar -- фолбэк на piper.
+    tts_engine: str = "silero"
 
     # --- Сервер ---
     host: str = "0.0.0.0"

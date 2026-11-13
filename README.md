@@ -9,7 +9,7 @@
 │  Android-телефон    │ ──────────────► │  ПК (без GPU, Python 3.12)       │
 │  • wake word (Vosk) │   WebSocket /   │  • llama.cpp + LLM (порт 8080)   │
 │  • запись речи      │   HTTP REST     │  • server.py  — API (порт 8090)  │
-│  • озвучка ответа   │ ◄────────────── │  • kokoro-ru  — TTS (порт 8091)  │
+│  • озвучка ответа   │ ◄────────────── │  • silero     — TTS (порт 8092)  │
 │  • кнопки/интерфейс │   WAV + JSON    │  • faster-whisper — STT (CPU)    │
 └─────────────────────┘                 └──────────────────────────────────┘
 ```
@@ -27,16 +27,18 @@
   запросы в течение короткого окна после ответа.
 - **Профили характера с голосами** (переключение голосом: «профиль цундере»):
 
-  | Профиль | Голос | Пол |
-  |---|---|---|
-  | Цензурный | dima | мужской |
-  | Нецензурный | dima | мужской |
-  | Цундере | sveta | женский |
-  | Яндере | masha | женский |
-  | Куудере | dima | мужской |
-  | Дередере | masha | женский |
+  | Профиль | silero (основной) | kokoro (страховка) | Piper-фолбэк | Пол |
+  |---|---|---|---|---|
+  | Цензурный | eugene | dima | denis | мужской |
+  | Нецензурный | aidar | dima | denis | мужской |
+  | Цундере | xenia | sveta | irina | женский |
+  | Яндере | kseniya | masha | irina | женский |
+  | Куудере | aidar | dima | denis | мужской (род не менялся) |
+  | Дередере | baya | masha | irina | женский |
 
-  Пол ассистента выводится из голоса озвучки и задаётся в system-промпте:
+  Голос берётся по активному движку озвучки (`ASSISTANT_TTS_ENGINE`,
+  основной — silero v5_6_ru, 48 кГц; kokoro — запасной). Пол ассистента
+  выводится из голоса озвучки и задаётся в system-промпте:
   на «ты мужчина или женщина?» он отвечает в роде своего голоса.
 - **Распознавание команд профиля**: точные стемы + нечёткое сопоставление
   (difflib) — STT может коверкать имена («Дэри Дэра», «нетнзурный»,
@@ -50,8 +52,13 @@
 - **Поиск в интернете** (DuckDuckGo по умолчанию, без API-ключей) с кратким
   голосовым пересказом найденного.
 - **Звонки**: поиск контакта в телефонной книге и набор номера.
-- **Озвучка**: kokoro-ru (sidecar, несколько русских голосов) с фолбэком на
-  Piper.
+- **Озвучка**: Silero v5_6_ru — основной TTS: sidecar `tts_silero_server.py`
+  на порту 8092 (отдельное окружение `.venv-tts`, 5 русских голосов, WAV
+  **48 кГц** mono PCM16; числа и латиницу проговаривает `ru-normalizr`
+  внутри sidecar). При падении sidecar — фолбэк на Piper (голос по полу
+  профиля). kokoro-ru остаётся запасным движком (`scripts\start-kokoro.ps1`,
+  порт 8091, ручной запуск). Телефон играет WAV по заголовку файла, поэтому
+  48 кГц дошли до него без правок клиента.
 - **Надёжность**: VAD-фильтр тишины, детект конца фразы, повтор verify при
   ложном wake, подавление обработки во время озвучки.
 - **Доступ из интернета**: собственный WSS-туннель с токеном и пиннингом
@@ -67,9 +74,12 @@ android/                клиент-приложение (Kotlin, foreground se
   app/src/main/assets/  голосовая модель Vosk (zip + лицензия Apache 2.0)
   app/src/test/         юнит-тесты (распознавание, фонетика, RMS, wake...)
 scripts/                скрипты запуска/настройки (PowerShell):
-  start-all.ps1           автозапуск стека (llama-server + server.py + kokoro + tunnel)
-  stop-all.ps1            остановка всего стека (8080/8090/8091/8443, есть -WhatIf)
-  start-kokoro.ps1        запуск TTS-sidecar
+  start-all.ps1           автозапуск стека (llama-server + server.py + silero-TTS + tunnel)
+  stop-all.ps1            остановка всего стека (8080/8090/8091/8092/8443, есть -WhatIf)
+  start-silero.ps1        запуск silero-TTS-sidecar (8092; прогрев ~15 с)
+  start-kokoro.ps1        запуск kokoro-sidecar вручную (страховка, 8091)
+  setup-tts-ab.ps1        разовый: окружение .venv-ab для A/B-харнесса TTS
+  run-tts-ab.ps1          исследовательский A/B-прогон TTS-движков (инструмент выбора движка)
   setup-firewall.ps1      разовый: правила фаервола 8090 (LAN) и 8443 (туннель) (админ)
   setup-adb.ps1           разовый: ADB-интерфейс телефона + фаервол (админ)
   diag-network.ps1        разовый: диагностика входящих IPv6/IPv4 для туннеля
@@ -99,20 +109,23 @@ server/                 Python-часть (здесь же .env, окружен�
     stream_parser.py        парсер SSE-стрима
     _time.py                ретраи/таймауты
   stt.py                  распознавание речи (faster-whisper, CPU, int8)
-  tts.py                  озвучка: kokoro-ru через sidecar, фолбэк Piper
-  tts_kokoro_server.py    sidecar kokoro-ru на 8091 (отдельное окружение .venv-tts)
+  tts.py                  озвучка: silero через sidecar (основной), kokoro (страховка), фолбэк Piper
+  tts_silero_server.py    sidecar silero v5_6_ru на 8092 (.venv-tts, 48 кГц, ru-normalizr внутри)
+  tts_kokoro_server.py    sidecar kokoro-ru на 8091 (страховка; отдельное окружение .venv-tts)
+  tts_ab/                 A/B-харнесс TTS-движков (исследовательский CLI; данные в data/tts_ab, вне git)
   tools.py                действия: поиск, Telegram, VK, звонки
   shopping_store.py       списки покупок: хранение data/shopping_lists.json
   config.py               настройки из .env (префикс ASSISTANT_)
   login_tg.py             разовый вход в Telegram (Telethon user session)
-  tests/                  pytest: 440 тестов (endpointing, decide, списки покупок, обновление APK...)
+  tests/                  pytest: 487 тестов (endpointing, decide, списки покупок, обновление APK...)
   pyproject.toml          ruff + pytest-конфигурация
   requirements.txt        зависимости основного окружения
   requirements-dev.txt    dev-зависимости (pytest, ruff)
   .env.example            шаблон настроек
   logs/                   логи телефона: phone.log + бэкапи (создаёт server.py при старте)
   data/                   данные: сертификат туннеля, сессия Telegram,
-                          списки покупок shopping_lists.json (не в git)
+                          списки покупок shopping_lists.json, артефакты
+                          TTS A/B (tts_ab/) (не в git)
 releases/                 каталог релизов APK (app-debug.apk + manifest.json, не в git)
 models/                 голоса Piper (*.onnx) внутри server/ — не в репозитории
 ```
@@ -127,7 +140,7 @@ Python-модули лежат плоско внутри `server/` (плоски
 
 ```powershell
 # Python (в server/, нужен dev-окружение: pip install -r requirements-dev.txt)
-.venv\Scripts\python.exe -m pytest -q      # 440 тестов
+.venv\Scripts\python.exe -m pytest -q      # 487 тестов
 .venv\Scripts\python.exe -m ruff check .   # линтер
 
 # Android (в android/)
@@ -164,8 +177,11 @@ cd <каталог-проекта>\server
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 
-# 3. Окружение для TTS-sidecar (kokoro-ru)
+# 3. Окружение для TTS-sidecar (silero — основной; kokoro — запасной)
 python -m venv .venv-tts
+.venv-tts\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv-tts\Scripts\pip install numpy soundfile omegaconf ru-normalizr
+#    kokoro-ru (страховка, по желанию):
 .venv-tts\Scripts\pip install kokoro phonopy pyyaml  # см. scripts\start-kokoro.ps1
 
 # 4. Голоса Piper (фолбэк озвучки)
@@ -176,13 +192,24 @@ python -m venv .venv-tts
 copy .env.example .env     # заполнить (см. «Настройка .env»)
 ```
 
+Веса Silero v5_6_ru (~141 МБ) в репозиторий не входят. Sidecar из сети
+ничего не качает (CWE-494: без кэша он отказывается стартовать, exit 1) —
+один раз наполните кэш torch_hub, дальше синтез идёт без сети:
+
+```powershell
+.venv-tts\Scripts\python -c "import torch; torch.hub.set_dir(r'<каталог-проекта>\server\.cache\torch_hub\hub'); torch.hub.load('snakers4/silero-models', 'silero_tts', language='ru', speaker='v5_6_ru', trust_repo=True)"
+```
+
+После этого в `server\.cache\torch_hub\hub\snakers4_silero-models_master`
+лежат `hubconf.py` и веса `src\silero\model\v5_6_ru.pt` (вне git).
+
 Модель для llama.cpp (Gemma/Qwen-класс, квантованная) кладётся в llama.cpp
 отдельно — этот репозиторий модель не содержит.
 
 ## Запуск
 
 ```powershell
-# Весь стек сразу (llama-server + API + туннель) — из любого каталога:
+# Весь стек сразу (llama-server + API + silero-TTS + туннель) — из любого каталога:
 powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 
 # Или по частям:
@@ -190,13 +217,17 @@ powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 cd server
 .venv\Scripts\python server.py             # API на 8090
 .venv\Scripts\python tunnel.py             # туннель на 8443 (wss)
-powershell -File ..\scripts\start-kokoro.ps1   # TTS на 8091 (нужен .venv-tts)
+powershell -File ..\scripts\start-silero.ps1   # silero TTS на 8092 (нужен .venv-tts; прогрев ~15 с)
+powershell -File ..\scripts\start-kokoro.ps1   # kokoro TTS на 8091 — запасной движок (ручной запуск)
+
+# Первый /tts после старта server.py может уйти на piper-фолбэк —
+# silero-sidecar прогревается ~15 с; разовое поведение, дальше озвучивает silero.
 
 # Проверка:
 curl http://127.0.0.1:8090/health
 curl -k https://127.0.0.1:8443/health     # самопроверка туннеля
 
-# Остановка всего стека (llama + API + kokoro + tunnel; -WhatIf — «показать, не трогая»):
+# Остановка всего стека (llama + API + kokoro + silero + tunnel; -WhatIf — «показать, не трогая»):
 powershell -ExecutionPolicy Bypass -File scripts\stop-all.ps1
 ```
 
@@ -220,7 +251,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-firewall.ps1   # 8090 (LA
 | `ASSISTANT_SEARCH_PROVIDER` | `duckduckgo` (по умолчанию) или `brave` |
 | `ASSISTANT_BRAVE_API_KEY` | нужен только для `brave` |
 | `ASSISTANT_WHISPER_MODEL` | `small` (по умолчанию) или `medium` (точнее, медленнее) |
-| `ASSISTANT_TTS_ENGINE` | `kokoro` (по умолчанию) или `piper` |
+| `ASSISTANT_TTS_ENGINE` | движок озвучки: `silero` (по умолчанию) / `kokoro` / `piper`. Ключ в `.env` перекрывает дефолт из `config.py`; сейчас ключа в `.env` нет — действует дефолт silero |
 | `ASSISTANT_HOST` / `ASSISTANT_PORT` | адрес и порт API (по умолчанию `0.0.0.0:8090`) |
 | `ASSISTANT_API_TOKEN` | общий секрет: заголовок `X-Gemma-Token` + открытие канала туннеля (пусто = только LAN) |
 | `ASSISTANT_TUNNEL_HOST` / `ASSISTANT_TUNNEL_PORT` | адрес/порт туннеля (по умолчанию `0.0.0.0:8443`) |
@@ -280,7 +311,7 @@ cd server
 1. LLM стримится через `llm.chat_stream()`; инкрементальный парсер
    (`_StreamParser`) вырезает законченные предложения из поля `reply` и
    отдельно ловит поле `query` (поисковый запрос для спекулятивного поиска).
-2. Каждое предложение уходит в TTS (kokoro-ru), и WAV-чанк сразу летит
+2. Каждое предложение уходит в TTS (silero), и WAV-чанк сразу летит
    телефону событием `audio`; текст — событием `sentence`.
 3. **Спекулятивный поиск**: поле `query` из первого токена запускает поиск
    заранее (кэш 180 с, таймаут 15 с) — когда приходит `needs_confirm`,
