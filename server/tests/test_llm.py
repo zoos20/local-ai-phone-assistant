@@ -71,6 +71,78 @@ class TestStreamParser:
         assert p.spoken == "Раз. Два."
 
 
+class TestStreamParserAction:
+    """З4 (вердикт A З3, 25/25 action-first): факт action извлекается из
+    стрима -- атрибут action заполняется, как только значение дописано;
+    работает в ОБОИХ порядках ключей."""
+
+    def test_action_first_known_before_first_sentence(self):
+        events = []
+        p = llm._StreamParser(on_action=events.append)
+        out = p.feed('{"action": "search", "args": {"query": "по')
+        assert out == []              # reply ещё не открыт
+        assert p.action == "search"   # факт уже известен ДО reply
+        assert events == ["search"]   # колбэк уже стрельнул
+        out = p.feed('года Москва"}, "reply": "Ищу погоду. Идёт."}')
+        assert out == ["Ищу погоду.", "Идёт."]  # сентенции reply ПОСЛЕ факта
+        assert p.reply_text == "Ищу погоду. Идёт."
+
+    def test_action_callback_fires_once(self):
+        events = []
+        p = llm._StreamParser(on_action=events.append)
+        p.feed('{"action": "none", "args": {}, "reply": "Привет!"}')
+        p.feed('{"action": "search"}')  # повторный ключ в сыром потоке
+        assert events == ["none"]       # ровно один раз
+        assert p.action == "none"
+
+    def test_old_reply_first_order_still_recognised(self):
+        # обратная совместимость: старый порядок reply -> action
+        events = []
+        p = llm._StreamParser(on_action=events.append)
+        out = p.feed(
+            '{"reply": "Привет! Как дела?", "action": "none", "args": {}}')
+        assert out == ["Привет!", "Как дела?"]
+        assert p.action == "none"
+        assert events == ["none"]
+
+    def test_action_after_reply_closed_watched(self):
+        # старый порядок: action приходит ПОСЛЕ закрытия reply --
+        # парсер продолжает следить (ветка _reply_closed)
+        p = llm._StreamParser()
+        assert p.feed('{"reply": "Готово.", ') == ["Готово."]
+        assert p.action is None
+        assert p.feed('"action": "search", "args": {}}') == []
+        assert p.action == "search"
+
+    def test_action_attribute_without_callback(self):
+        p = llm._StreamParser()
+        assert p.feed('{"action": "call", "args": {}, "reply": "Звоню."}') \
+            == ["Звоню."]
+        assert p.action == "call"  # атрибут заполняется и без колбэка
+
+    def test_partial_action_value_not_reported(self):
+        # значение ещё не дописано (нет закрывающей кавычки) -- тишина
+        events = []
+        p = llm._StreamParser(on_action=events.append)
+        p.feed('{"action": "se')
+        assert p.action is None
+        assert events == []
+        p.feed('arch", "args": {}}')
+        assert p.action == "search"
+        assert events == ["search"]
+
+    def test_action_callback_exception_does_not_break_stream(self):
+        # гейт не должен ломать стрим (как on_query)
+        def boom(_action):
+            raise RuntimeError("gate down")
+
+        p = llm._StreamParser(on_action=boom)
+        out = p.feed(
+            '{"action": "none", "args": {}, "reply": "Привет! Пока."}')
+        assert out == ["Привет!", "Пока."]  # стрим выжил
+        assert p.action == "none"
+
+
 # ---------------------------------------------------------------------------
 # extract_json: первый сбалансированный объект
 # ---------------------------------------------------------------------------
@@ -116,6 +188,19 @@ class TestFastReply:
 
     def test_long_text_not_matched(self):
         assert llm.fast_reply("который час " * 10) is None
+
+    def test_weekday_stt_variant_without_and(self):
+        # Д6: STT-вариант «какой день неделя» (без «и») -- тоже
+        # fast-ответ, а не LLM (M1 3711-3853 против ~2800 у fast,
+        # data/voice_latency/baseline.md). «день недели» и «день»
+        # уже матчились; «день рождения» и т.п. НЕ расширяются --
+        # только кварцевый вопрос дня недели.
+        assert llm.fast_reply("какой день неделя") is not None
+        assert llm.fast_reply("какой день недели") is not None
+        assert llm.fast_reply("какой день") is not None
+        assert llm.fast_reply("Гемма, какой день неделя") is not None
+        assert llm.fast_reply("какой день рождения") is None
+        assert llm.fast_reply("какой день недели сегодня") is None
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +292,104 @@ def test_decide_end_to_end(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# З4 (вердикт A З3): on_action -- факт action для гейта озвучки (З5).
+# action-first стрим: колбэк стреляет ДО первой сентенции reply, ровно
+# один раз; старый порядок тоже распознаётся; вторая попытка молчит.
+# ---------------------------------------------------------------------------
+class TestDecideStreamOnAction:
+    @staticmethod
+    def _patch_stream(monkeypatch, raw, chunk=7):
+        """Подмена chat_stream: кормит raw по кусочкам (эмуляция стрима)."""
+        import importlib
+        # importlib, а не `import llm.decide`: фасад llm реэкспортирует
+        # функцию decide -- getattr(llm, "decide") даёт её, а не подмодуль
+        decide_mod = importlib.import_module("llm.decide")
+
+        def fake_chat_stream(msgs, on_token=None):
+            for i in range(0, len(raw), chunk):
+                on_token(raw[i:i + chunk])
+            return raw
+
+        monkeypatch.setattr(decide_mod, "chat_stream", fake_chat_stream)
+
+    def test_action_known_before_first_sentence(self, monkeypatch):
+        self._patch_stream(
+            monkeypatch,
+            '{"action": "search", "args": {"query": "погода Москва"}, '
+            '"reply": "Ищу погоду. Идёт."}')
+        events: list[tuple[str, str]] = []
+        d = llm.decide_stream(
+            "погода", on_sentence=lambda s: events.append(("s", s)),
+            on_action=lambda a: events.append(("a", a)))
+        assert d.action == "search"
+        assert events[0] == ("a", "search")   # факт раньше первой сентенции
+        assert events[1] == ("s", "Ищу погоду.")
+        assert [k for k, _ in events].count("a") == 1  # ровно один раз
+
+    def test_old_reply_first_order_still_fires(self, monkeypatch):
+        self._patch_stream(
+            monkeypatch,
+            '{"reply": "Привет! Как дела?", "action": "none", "args": {}}')
+        events: list[tuple[str, str]] = []
+        d = llm.decide_stream(
+            "привет", on_sentence=lambda s: events.append(("s", s)),
+            on_action=lambda a: events.append(("a", a)))
+        assert d.action == "none"
+        assert events[0] == ("s", "Привет!")   # старый порядок: reply первым
+        assert events[-1] == ("a", "none")     # action-факт приходит позже
+
+    def test_second_attempt_is_silent(self, monkeypatch):
+        # первая попытка -- невалидный JSON (пустой reply) -> повтор с
+        # напоминанием; on_action стреляет ТОЛЬКО на первой попытке
+        # (гейт З5 видит факт action только от первого стрима), вторая
+        # идёт блокирующим chat() молча. Реплику первой попытки берём
+        # ПУСТОЙ: любой непустой reply стрим-путь отдаст хвостом через
+        # on_sentence (is_committed) -- повтор тогда не случится вовсе.
+        import importlib
+        decide_mod = importlib.import_module("llm.decide")
+
+        def fake_chat_stream(msgs, on_token=None):
+            raw = '{"reply": "", "action": "none", "args": {}}'
+            on_token(raw)
+            return raw
+
+        def fake_chat(msgs, max_tokens=None):
+            return ('{"reply": "Повтор", "action": "search", '
+                    '"args": {"query": "погода"}}')
+
+        monkeypatch.setattr(decide_mod, "chat_stream", fake_chat_stream)
+        monkeypatch.setattr(decide_mod, "chat", fake_chat)
+        actions: list[str] = []
+        sentences: list[str] = []
+        d = llm.decide_stream("привет", on_sentence=sentences.append,
+                              on_action=actions.append)
+        assert actions == ["none"]           # вторая попытка молчит
+        assert sentences == []               # озвученного не было
+        assert d.action == "search"          # решение со второй попытки
+
+    def test_on_action_optional(self, monkeypatch):
+        self._patch_stream(
+            monkeypatch,
+            '{"action": "none", "args": {}, "reply": "Привет!"}')
+        sentences: list[str] = []
+        d = llm.decide_stream("привет", on_sentence=sentences.append)
+        assert d.action == "none"            # kwarg опционален
+        assert sentences == ["Привет!"]
+
+    def test_on_action_without_on_sentence(self, monkeypatch):
+        # on_action -- самостоятельный потребитель факта: стрим-путь
+        # включается ради него и без on_sentence
+        self._patch_stream(
+            monkeypatch,
+            '{"action": "search", "args": {"query": "погода"}, '
+            '"reply": "Ищу."}')
+        actions: list[str] = []
+        d = llm.decide_stream("погода", on_action=actions.append)
+        assert actions == ["search"]
+        assert d.action == "search"
+
+
+# ---------------------------------------------------------------------------
 # Списки покупок (фича, задача 4): SYSTEM_PROMPT, Decision, валидация args
 # ---------------------------------------------------------------------------
 _SHOPPING_ACTIONS = (
@@ -235,11 +418,13 @@ class TestShoppingPrompt:
             assert action in llm.SYSTEM_PROMPT
 
     def test_six_or_more_shopping_examples(self):
+        # З4: примеры и схема в порядке action-first (строка начинается
+        # с {"action"); схемная строка считается примером, как и раньше
         lines = llm.SYSTEM_PROMPT.splitlines()
-        examples = [ln for ln in lines if ln.startswith('{"reply"')]
+        examples = [ln for ln in lines if ln.startswith('{"action"')]
         shopping = [ln for ln in examples if '"action": "shopping_' in ln]
         assert len(shopping) >= 6  # >=6 примеров реплика -> JSON
-        assert len(examples) >= 9  # старые 3 + >=6 новых
+        assert len(examples) >= 9  # старые 3 + >=6 новых (+ строка схемы)
 
     def test_examples_cover_required_utterances(self):
         p = llm.SYSTEM_PROMPT
@@ -257,7 +442,7 @@ class TestShoppingPrompt:
     def test_delete_has_example(self):
         # QA: shopping_delete — деструктивный, обязан иметь пример
         lines = [ln for ln in llm.SYSTEM_PROMPT.splitlines()
-                 if ln.startswith('{"reply"')]
+                 if ln.startswith('{"action"')]
         assert any('"action": "shopping_delete"' in ln for ln in lines), \
             "нет примера shopping_delete"
 
@@ -512,13 +697,15 @@ class TestShoppingNoInvention:
         assert "«Создай список покупок» — не назван ни один товар" in p
 
     def test_refusal_examples_answer_verbatim(self):
-        # реплики примеров отвечают предписанной формулировкой:
+        # реплики примеров отвечают предписанной формулировкой;
+        # порядок ключей action-first (З4, вердикт A З3):
         # add-отказ -- вербатим из правила; create без позиций --
         # нейтральное обещание и ПУСТЫЕ args (канон задачи 20)
         p = llm.SYSTEM_PROMPT
-        assert '"reply": "Что докупить? Назови товары и количество."' in p
-        assert ('{"reply": "Создаю список. Назови, что в него положить.",'
-                ' "action": "shopping_create", "args": {}}') in p
+        assert ('{"action": "none", "args": {}, '
+                '"reply": "Что докупить? Назови товары и количество."}') in p
+        assert ('{"action": "shopping_create", "args": {}, "reply": '
+                '"Создаю список. Назови, что в него положить."}') in p
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +776,10 @@ class TestShoppingListsAndRouting:
         p = llm.SYSTEM_PROMPT
         assert "action=shopping_lists" in p
         # (1) «какие списки у меня есть» -> shopping_lists args {}
+        # (порядок ключей action-first, З4)
         assert "«Какие списки у меня есть?»" in p
-        assert ('{"reply": "Перечисляю.", "action": "shopping_lists",'
-                ' "args": {}}') in p
+        assert ('{"action": "shopping_lists", "args": {}, '
+                '"reply": "Перечисляю."}') in p
 
     def test_products_after_items_question_are_add(self):
         # факт 1: продолжение «Хлеб и сахар» после вопроса «что купить?» --
@@ -601,8 +789,8 @@ class TestShoppingListsAndRouting:
                 "сразу после «что добавить/купить?»" in p)
         assert ("shopping_add с items и БЕЗ list (в активный список), "
                 "НЕ повторный create" in p)
-        assert ('{"reply": "Записываю хлеб и сахар.",'
-                ' "action": "shopping_add", "args": {}}') in p
+        assert ('{"action": "shopping_add", "args": {}, '
+                '"reply": "Записываю хлеб и сахар."}') in p
 
     def test_list_arg_only_when_name_spoken(self):
         # факт 3: имя списка, выуженное из истории, дало дубликаты --
@@ -611,9 +799,11 @@ class TestShoppingListsAndRouting:
         assert ("list в args -- только имя, произнесённое "
                 "пользователем в ЭТОЙ фразе" in p)
         # (2) «создай список покупок на неделю» -> create с именем,
-        # собранным ТОЛЬКО из слов пользователя
+        # собранным ТОЛЬКО из слов пользователя (порядок action-first, З4)
         assert "«Создай список покупок на неделю» (имя -- из слов пользователя)" in p
-        assert '"args": {"name": "Список покупок на неделю"}}' in p
+        assert ('{"action": "shopping_create", "args": '
+                '{"name": "Список покупок на неделю"}, "reply": '
+                '"Создаю список «Список покупок на неделю»."}') in p
         # старая нормализация «На неделю» устранена из примеров
         assert '"name": "На неделю"' not in p
 
@@ -624,9 +814,10 @@ class TestShoppingListsAndRouting:
         assert "не утверждай из памяти, сколько списков и что в них" in p
         assert "«ещё один список» без имени -- уточни имя, не создавай" in p
         # (5) «Создаю ещё один список» -> none + вопрос, не второй дубль
+        # (порядок ключей action-first, З4)
         assert "«Создаю ещё один список»" in p
-        assert ('{"reply": "Как назвать новый список?", "action": "none",'
-                ' "args": {}}') in p
+        assert ('{"action": "none", "args": {}, '
+                '"reply": "Как назвать новый список?"}') in p
 
 
 # ---------------------------------------------------------------------------
@@ -652,19 +843,21 @@ class TestShoppingReadNameCanon:
         # (1)+(2) «что у меня по списку покупок?» -> shopping_read с
         # каноническим args.list «Список покупок»; прежний args {}
         # (фолбэк на активный -- живой факт 10:00:20, мимо) переучен:
-        # read-примеров с пустыми args больше нет
+        # read-примеров с пустыми args больше нет (порядок action-first,
+        # З4: args стоит сразу после action)
         p = llm.SYSTEM_PROMPT
-        assert ('{"reply": "Читаю список покупок.", "action": "shopping_read",'
-                ' "args": {"list": "Список покупок"}}') in p
-        assert '"action": "shopping_read", "args": {}}' not in p
+        assert ('{"action": "shopping_read", "args": '
+                '{"list": "Список покупок"}, '
+                '"reply": "Читаю список покупок."}') in p
+        assert '"action": "shopping_read", "args": {}' not in p
 
     def test_read_second_example_na_nedelyu_verbatim(self):
         # (3) «что по на неделю» -> {"list": "На неделю"} -- контраст-пример:
         # каноническое имя хранилища пишется как есть
         p = llm.SYSTEM_PROMPT
         assert "«Что по на неделю?»" in p
-        assert ('{"reply": "Читаю список на неделю.", "action": "shopping_read",'
-                ' "args": {"list": "На неделю"}}') in p
+        assert ('{"action": "shopping_read", "args": {"list": "На неделю"},'
+                ' "reply": "Читаю список на неделю."}') in p
 
     def test_task22_contracts_untouched(self):
         # (4) контракт задачи 22 не ослаблен: имя во фразе => args.list
@@ -672,9 +865,86 @@ class TestShoppingReadNameCanon:
         # add без list (пример не тронут); существующие тест-фразы
         # («по списку покупок», «В списке на неделю») живы
         p = llm.SYSTEM_PROMPT
-        assert ('"args": {"list": "На неделю",'
-                ' "items": [{"text": "сметана"}]}}') in p
-        assert ('{"reply": "Записываю хлеб и сахар.",'
-                ' "action": "shopping_add", "args": {}}') in p
+        assert ('{"action": "shopping_add", "args": {"list": "На неделю", '
+                '"items": [{"text": "сметана"}]}, '
+                '"reply": "Добавляю сметану в список на неделю."}') in p
+        assert ('{"action": "shopping_add", "args": {}, '
+                '"reply": "Записываю хлеб и сахар."}') in p
         assert "по списку покупок" in p
         assert "В списке на неделю" in p
+
+
+# ---------------------------------------------------------------------------
+# З4 (вердикт A З3, 25/25 action-first): схема и ВСЕ примеры SYSTEM_PROMPT
+# переставлены в порядок {action, args, reply}; тексты реплик/args/правил
+# не менялись (алгоритм перестановки З3 -- scripts/probe-key-order.py).
+# ---------------------------------------------------------------------------
+class TestActionFirstPromptOrder:
+    def test_schema_line_action_first(self):
+        lines = llm.SYSTEM_PROMPT.splitlines()
+        schema = [ln for ln in lines if ln.startswith('{"action": "<search|')]
+        assert len(schema) == 1
+        assert schema[0].endswith('"reply": "<текст для озвучки вслух>"}')
+
+    def test_no_line_left_in_old_order(self):
+        # ни одна строка-схема/пример не осталась в старом порядке reply-first
+        old = [ln for ln in llm.SYSTEM_PROMPT.splitlines()
+               if ln.startswith('{"reply"')]
+        assert old == []
+
+    def test_schema_reminder_action_first(self):
+        import importlib
+        decide_mod = importlib.import_module("llm.decide")
+        reminder = decide_mod._SCHEMA_REMINDER
+        assert "{action, args, reply}" in reminder
+        assert "{reply, action, args}" not in reminder
+
+
+# ---------------------------------------------------------------------------
+# З4 (живой инцидент 14.11 13:28:46): «кто такой Пушкин?» ушёл в
+# action=search (интернет + confirm-гейт), хотя ответ есть в общих знаниях
+# модели. Фикс -- промпт-уровень: правило выбора search/none рядом с
+# описанием search + few-shot контрпример «Пушкин» -> action=none.
+# Поведенческие фолбэки НЕ тронуты (и не проверяются здесь):
+# дайджест -> search (test_search_digest_fallback), ответ из памяти при
+# отказе (answer_from_memory), валидация пустого query
+# (test_missing_search_query_rejected).
+# ---------------------------------------------------------------------------
+class TestKnowledgeVsSearchRouting:
+    """SYSTEM_PROMPT: вопросы из общих знаний -- action=none БЕЗ интернета;
+    action=search -- только актуальные/быстро меняющиеся данные."""
+
+    def test_knowledge_rule_present(self):
+        p = llm.SYSTEM_PROMPT
+        # устойчивые подстроки правила выбора (рядом с описанием search)
+        assert "Отвечай сам (action=none)" in p
+        assert "есть в твоих общих знаниях" in p
+        assert "АКТУАЛЬНЫХ данных" in p
+        assert "либо если ты честно не знаешь ответ" in p
+
+    def test_pushkin_counterexample_none(self):
+        p = llm.SYSTEM_PROMPT
+        # реплика-кейс с пояснением и JSON-контрпример (action-first порядок
+        # ключей, З4 -- см. TestActionFirstPromptOrder)
+        assert "«Кто такой Пушкин?» — ответ из общих знаний, поиск НЕ нужен" in p
+        assert ('{"action": "none", "args": {}, "reply": '
+                '"Пушкин — великий русский поэт XIX века, '
+                'автор «Евгения Онегина»."}') in p
+
+    def test_conversational_prefix_none(self):
+        # Д3 (живой промах 14.11, data/voice_latency/baseline.md):
+        # вариация «Значит, кто такой Пушкин?» ушла в search 1/3.
+        # few-shot-пример с префиксом-связкой учит: префикс маршрут
+        # не меняет (общие знания -> none, поиск не нужен). Сосед
+        # без префикса не сломан; few-shot -- часть SYSTEM_PROMPT,
+        # поэтому проверяется текст промпта (без вызова реальной LLM).
+        p = llm.SYSTEM_PROMPT
+        assert ("«Значит, кто такой Пушкин?» — префикс-связка не меняет "
+                "маршрут: общие знания, поиск НЕ нужен") in p
+        # JSON-контрпример при префиксе тот же none (action-first,
+        # как у соседних) -- строка-ответ ровно у обоих примеров
+        assert p.count('{"action": "none", "args": {}, "reply": '
+                       '"Пушкин — великий русский поэт XIX века, '
+                       'автор «Евгения Онегина»."}') == 2
+        # сосед без префикса не сломался
+        assert "«Кто такой Пушкин?» — ответ из общих знаний, поиск НЕ нужен" in p

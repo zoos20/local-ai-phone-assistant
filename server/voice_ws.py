@@ -1,18 +1,27 @@
 import asyncio
-import base64
 import json
 import logging
 import secrets
 import time
 from contextlib import suppress
-from dataclasses import dataclass
 
 from fastapi import APIRouter, WebSocket
 
 import llm
 from answer import _answer
 from config import settings
+from endpointing import (
+    _WS_BYTES_PER_MS,
+    _WS_END_TAIL_S,
+    _WS_FRAME,
+    _WS_MAX_PCM_BYTES,
+    _WS_MAX_SESSIONS,
+    _WS_RECV_IDLE_S,
+    _WS_VOICE_MIN,
+    EndpointDetector,
+)
 from search import _prefetch_search
+from voice_gate import StreamGate
 
 log = logging.getLogger("assistant")
 
@@ -32,158 +41,41 @@ router = APIRouter()
 #                      {"event":"hear","text":...}  -- сегмент распознан
 #                                                      НА ЛЕТУ (stt идёт
 #                                                      параллельно речи);
-#                      {"event":"sentence","text":..}-- финальная реплика
-#                                                      (задача 16: mid-stream
-#                                                      предложения модели
-#                                                      НЕ озвучиваются);
-#                      {"event":"audio","b64":...}  -- WAV финальной реплики
+#                      {"event":"sentence","text":..}-- реплика: стрим-чанк
+#                                                      (З5, озвучка стрима
+#                                                      при action=none) или
+#                                                      финальная реплика;
+#                      {"event":"audio","b64":...}  -- WAV реплики
 #                                                      (sentence+audio всегда
 #                                                      РАНЬШЕ reply-event);
-#                      {"event":"reply","reply":...,"streamed":bool}
+#                      {"event":"reply","reply":...,"streamed":bool
+#                                       [,"reply_replaced":true]}
 #                                                     -- итог: reply целиком
 #                                                      + confirm/token;
 #                                                      streamed=True -- чанки
 #                                                      уже играли, НЕ
 #                                                      озвучивать повторно;
+#                                                      reply_replaced=true --
+#                                                      опц. поле (З5): чанки
+#                                                      НЕ равны финалу --
+#                                                      телефон (З6) гасит
+#                                                      очередь чанков и
+#                                                      играет финал
+#                                                      (отсутствие поля =
+#                                                      старое поведение);
 #                      {"event":"done"}             -- всё.
 # Endpointing -- на сервере: адаптивный порог (фон ×2.5, как на телефоне)
-# + тишина >= _WS_QUIET_MS после голоса. Сегментный stt на лету
-# параллелит распознавание с речью: после конца фразы whisper'у остаётся
-# доспознать только хвост.
+# + тишина >= _WS_QUIET_MS после голоса. Режим детектора -- query
+# ?prelude=: 1/нет (wake: прелюдия = хвост «Геммы», защита grace) /
+# 0 (follow-up: команда без «Геммы», закрытие по тишине без гейта grace).
+# Сегментный stt на лету параллелит распознавание с речью: после конца
+# фразы whisper'у остаётся доспознать только хвост.
 # --------------------------------------------------------------------------
-WS_RATE = 16000                                   # PCM от телефона: 16 кГц
-_WS_BYTES_PER_MS = WS_RATE * 2 // 1000           # 32 байта/мс (s16le mono)
-_WS_FRAME = _WS_BYTES_PER_MS * 100               # RMS-кадр: 100 мс
-_WS_QUIET_MS = 1300          # тишина после голоса -> endpoint (было 3000
-                             # на телефоне; хвост досылается клиентом).
-                             # 1600->1300 (фаза 6, п. 4): сокращаем
-                             # мёртвую паузу перед ответом; если «не
-                             # дослушивает» -- вернуть 1600.
-_WS_GRACE_MS = 2500          # первые мс не проверяем: хвост «Геммы»
-                             # (prelude) + пауза до команды
-_WS_SEG_QUIET_MS = 900       # тишина -> речевой сегмент закрыт (stt на лету)
-_WS_SEG_MIN_MS = 600         # сегменсы короче не распознаём отдельно
-# Голос: rms > фон*2.5 И > _WS_VOICE_MIN. Замер 29.10 на живых записях:
-# фон стабильно 100-130, речь p25=170-580, p50=290-730; кадры >400 --
-# лишь 12-21% (починка «endpoint=5000 во всех сессиях»: при старом пороге
-# 500*2.5=1250 речь НЕ проходила никогда -> no_voice таймаут 5 с).
-_WS_VOICE_MIN = 250.0
-_WS_ECHO_START = 120.0       # стартовый фон = реальный фон комнаты (120)
-_WS_ECHO_DECAY = 0.97        # адаптивный фон: экспоненциальное скольжение
-_WS_END_TAIL_S = 6.0         # ждём «end»/хвост от клиента после endpoint
-_WS_NO_VOICE_MS = 5000       # голоса не было совсем -> endpoint (иначе
-                             # телефон висит в записи до своего лимита)
-# Лимиты ресурсов (план ревью A1): защита от «вечной» заливки PCM,
-# простоя подключившегося клиента и параллельных сессий (стримы делят
-# CPU whisper'а, больше двух убивают отзывчивость).
-_WS_MAX_PCM_S = 90           # максимум аудио на одну сессию, секунд
-_WS_MAX_PCM_BYTES = WS_RATE * 2 * _WS_MAX_PCM_S
-_WS_RECV_IDLE_S = 45.0       # прость клиента в основном цикле -> обрыв
-_WS_MAX_SESSIONS = 2         # одновременных голосовых сессий
+# Константы _WS_* и EndpointDetector/FrameAction -- в endpointing.py (Д1,
+# шаг 1): ЕДИНСТВЕННЫЙ источник значений, пороги §7 не меняются; сюда
+# импортируются только используемые имена. _WS_ACTIVE -- мутабельный
+# счётчик сессий, живёт здесь (патчится тестами).
 _WS_ACTIVE = 0               # текущее число сессий (счётчик ниже)
-
-
-# --------------------------------------------------------------------------
-# Endpointing-автомат (п. 2.7 рефакторинга): изменяемое состояние приёма
-# (адаптивный фон echo, armed/last_voice/text_end, позиция сегмента
-# seg_start, финал endpointed/endpoint_ms) вынесено из ws_voice в класс с
-# чистым состоянием -- одна точка и точка для тестов. ws_voice лишь подаёт
-# кадр и исполняет решения (endpoint -> отправить событие и разорвать
-# приём; segment -> запустить фоновый stt). ПОРОГИ _WS_* выше НЕ трогаются
-# (читаются как есть), поведение идентично прежнему инлайн-коду.
-# --------------------------------------------------------------------------
-@dataclass(frozen=True)
-class FrameAction:
-    """Решение автомата по одному RMS-кадру (исполняет ws_voice)."""
-
-    is_voice: bool = False
-    endpoint: bool = False         # закрывать приём (событие endpoint)
-    segment: bytes | None = None   # срезанный речевой сегмент -> фоновый stt
-
-
-class EndpointDetector:
-    """Серверный endpointing + сегментирование по тишине (конвейер ws_voice).
-
-    Состояние сессии (чистое, без I/O -- тестируется напрямую):
-        echo      -- адаптивный уровень фона (экспоненциальное скольжение);
-        armed     -- уже был голос ПОСЛЕ grace (можно закрывать по тишине);
-        last_voice, text_end -- конец последнего голоса и длина тишины;
-        seg_start -- начало нераспознанного речевого сегмента (в байтах);
-        endpointed / endpoint_ms -- финал автомата.
-    """
-
-    def __init__(self) -> None:
-        self.echo: float = _WS_ECHO_START   # скользящий уровень фона
-        self.armed: bool = False            # уже был голос (после grace)
-        self.last_voice: int = 0            # конец последнего голоса (байты)
-        self.text_end: float = 0.0          # мс тишины после последнего голоса
-        self.seg_start: int = 0             # начало сегмента (байты)
-        self.endpointed: bool = False
-        self.endpoint_ms: float = 0.0
-
-    def feed(self, pcm: bytes | bytearray, *, rms: float, t_ms: float,
-             stt_busy: bool) -> FrameAction:
-        """Один RMS-кадр -> решение (голос / endpoint / срез сегмента).
-
-        pcm, rms, t_ms -- те же величины, что считал ws_voice (rms --
-        последний 100-мс кадр, t_ms -- позиция в записи); stt_busy --
-        не запущен ли уже фоновый сегмент (два параллельных инференса
-        делили бы CPU whisper'а).
-        """
-        if self.endpointed:
-            # приём уже разорван (ws_voice выходит из цикла сразу после
-            # endpoint) -- кадр больше не кормим
-            return FrameAction()
-        is_voice = rms > max(self.echo * 2.5, _WS_VOICE_MIN)
-        if is_voice:
-            # фон НЕ обновляем голосом (иначе за 2-3 с речи порог
-            # echo*2.5 догонит сам голос и armed залипнет -- фикс
-            # живого теста 29.10)
-            if t_ms >= _WS_GRACE_MS:
-                # живой голос ПОСЛЕ prelude -> можно закрывать по тишине
-                # (голос из prelude не включает armed: иначе тишина
-                # «между Геммой и командой» дала бы endpoint до начала
-                # команды)
-                self.armed = True
-            self.last_voice = len(pcm)
-            self.text_end = 0.0
-            return FrameAction(is_voice=True)
-
-        # адаптируемся только к тишине/фону
-        self.echo = self.echo * _WS_ECHO_DECAY + rms * (1 - _WS_ECHO_DECAY)
-        if not self.armed:
-            if t_ms >= _WS_NO_VOICE_MS:
-                # голоса не было ВООБЩЕ (тишина/шум: armed не включился)
-                # -> endpoint по таймауту, иначе телефон висит в записи
-                # до своего локального лимита. stt финала скажет пусто ->
-                # «Не расслышал».
-                self.endpointed = True
-                self.endpoint_ms = t_ms
-                return FrameAction(endpoint=True)
-            return FrameAction()
-
-        self.text_end = t_ms - self.last_voice / _WS_BYTES_PER_MS
-        # endpoint: тишина >= порога после голоса (и только
-        # после grace: хвост «Геммы» prelude не должен рвать)
-        if self.text_end >= _WS_QUIET_MS and t_ms >= _WS_GRACE_MS:
-            self.endpointed = True
-            self.endpoint_ms = t_ms
-            # сегмент в этот кадр не срезаем (как и раньше: break до
-            # проверки сегмента) -- его целиком возьмёт финальный stt
-            return FrameAction(endpoint=True)
-        # ранний сегментный stt: пауза в речи -> сегмент закрыт.
-        # ВАЖНО (фикс живого прогона 29.10): cut НЕ по last_voice
-        # (тихий конец фразы не проходит адаптивный порог ->
-        # «нахуй, Дима» терялось), а по ТЕКУЩЕЙ позиции: в кусок
-        # попадает уже накопленная тишина (~0.9 с), её VAD
-        # отфильтрует, а речь гарантированно целиком.
-        if (not stt_busy and self.text_end >= _WS_SEG_QUIET_MS
-                and (len(pcm) - self.seg_start)
-                >= _WS_SEG_MIN_MS * _WS_BYTES_PER_MS):
-            pkt = bytes(pcm[self.seg_start:len(pcm)])
-            self.seg_start = len(pcm)
-            return FrameAction(segment=pkt)
-        return FrameAction()
 
 
 @router.websocket("/ws_voice")
@@ -237,7 +129,20 @@ async def ws_voice(ws: WebSocket) -> None:
     # и endpointed/endpoint_ms живут в EndpointDetector (чистое состояние,
     # пороги _WS_* не трогаем); здесь кадры только подаются и решения
     # исполняются.
-    det = EndpointDetector()
+    # Режим endpointing от клиента (фича «почти мгновенный голосовой
+    # ответ»): телефон знает режим и сообщает его query-параметром.
+    #   ?prelude=0 -- follow-up: команда без «Геммы», прелюдия = начало
+    #                 самой команды, защита паузы «до команды» не нужна
+    #                 (детектор закрывает приём по тишине, а не по
+    #                 NO_VOICE-таймауту).
+    #   ?prelude=1 или параметра НЕТ -- wake-режим с защитой прелюдии.
+    # Совместимость: старый APK параметр не шлёт -> prelude=True ->
+    # прежнее поведение; новый APK + старый сервер -- старый сервер не
+    # читает неизвестный query-параметр (деградация к прежнему M1, не
+    # поломка).
+    prelude = ws.query_params.get("prelude", "1") != "0"
+    det = EndpointDetector(prelude=prelude)
+    log.info("ws_voice: session start (prelude=%s)", prelude)
     stt_busy = False
     # Событие «фоновый сегмент дораспознан» (п. 2.1 рефакторинга): ждём
     # конца _seg_job через await ev.wait() вместо busy-wait
@@ -250,7 +155,65 @@ async def ws_voice(ws: WebSocket) -> None:
     # -- исключение невозможно было диагностировать («exception never
     # retrieved») и нельзя было погасить при закрытии сессии.
     seg_task: asyncio.Task | None = None
+    # З5: ссылка на воркер озвучки стрим-сентенций (создаётся в ответной
+    # фазе); гасится при закрытии сессии -- как seg_task.
+    worker_task: asyncio.Task | None = None
     heard: list[str] = []     # сегменты, распознанные на лету
+    # ---------------- телеметрия стадий (З1, метка «ws_voice timing») ---
+    # Все величины -- на уже существующих часах (t0/perf_counter),
+    # поведение конвейера не меняется. Объявления подняты СЮДА из
+    # ответной фазы, чтобы строка писалась и на ветке «Не расслышал»
+    # (там first_token/decision/tts_first/audio_send естественно None:
+    # LLM и озвучки не было; fast_reply/profile/forget идут полным
+    # путём -- у них None только first_token).
+    last_voice_at: float | None = None  # wall последнего голосового кадра
+    stt_seg_ms: list[int] = []          # длительности transcribe_pcm сегментов
+    audio_send_at = [None]              # holder: wall первого send_json
+                                        # «audio» -- пишет StreamGate,
+                                        # читает _timing_line (ниже);
+                                        # список, чтобы запись из гейта
+                                        # была видна здесь
+    t_ask: float | None = None          # старт ответной фазы
+    decision_ms: int | None = None      # длительность _answer (от t_ask)
+    first_ms: list[int] = []            # первый токен LLM (от t_ask)
+    tts_first_ms: list[int] = []        # первый чанк TTS (от t_ask; пишет
+                                        # StreamGate)
+
+    def _timing_line(text: str, *, chunks: int) -> None:
+        """З1: ЕДИНЫЙ лог-лайн телеметрии на каждый ws-ответ С ответом.
+
+        Пишется на всех выходах С ответом: полный путь (после done) и
+        ветка «Не расслышал»; fast_reply/profile/forget идут тем же
+        полным путём. Где ответа НЕТ -- строки нет (abort, disconnect,
+        лимит аудио, исключение: до ответа не дошло, M1 не определён;
+        abnormal-путь уже логируется «session ended abnormally»).
+        Заменяет итоговую строку «ws_voice: done in ...»; пре-ответная
+        «endpoint=... stt_tail=...» ОСТАВЛЕНА (решение З1: чекпоинт --
+        если сессия падает в ответной фазе, услышанное и позиция
+        endpoint видны по ней).
+        Поля (None -- значения нет): last_voice_ms -- wall последнего
+        голосового кадра от t0 (голос в хвосте ПОСЛЕ endpoint кадрами
+        не разбирается -- ограничение приёма, не телеметрии);
+        voice_pos_ms -- контроль: позиция det.last_voice в записи;
+        audio_send_ms -- M1: wall первого send_json «audio» минус
+        last_voice_ms.
+        """
+        audio_send: int | None = None
+        if audio_send_at[0] is not None and last_voice_at is not None:
+            audio_send = int((audio_send_at[0] - last_voice_at) * 1000)
+        last_voice: int | None = None
+        if last_voice_at is not None:
+            last_voice = int((last_voice_at - t0) * 1000)
+        log.info(
+            "ws_voice timing: last_voice_ms=%s endpoint_ms=%d "
+            "stt_total_ms=%d first_token_ms=%s decision_ms=%s "
+            "tts_first_ms=%s audio_send_ms=%s total_ms=%d chunks=%d "
+            "voice_pos_ms=%d heard=%r",
+            last_voice, int(det.endpoint_ms), sum(stt_seg_ms) + stt_ms,
+            first_ms[0] if first_ms else None, decision_ms,
+            tts_first_ms[0] if tts_first_ms else None, audio_send,
+            int((time.perf_counter() - t0) * 1000), chunks,
+            int(det.last_voice / _WS_BYTES_PER_MS), text)
 
     def now_ms() -> float:
         return len(pcm) / _WS_BYTES_PER_MS
@@ -266,7 +229,11 @@ async def ws_voice(ws: WebSocket) -> None:
         """Распознавание завершённого сегмента в фоне (не мешает приёму)."""
         nonlocal stt_busy
         try:
+            t_seg = time.perf_counter()
             t = await asyncio.to_thread(stt.transcribe_pcm, pkt)
+            # З1: длительность сегментного stt -- в stt_total_ms телеметрии
+            # (сумма сегментов + хвостовой stt_ms в итоговой строке)
+            stt_seg_ms.append(int((time.perf_counter() - t_seg) * 1000))
             if t:
                 heard.append(t)
                 await ws.send_json(
@@ -327,6 +294,13 @@ async def ws_voice(ws: WebSocket) -> None:
             # только ИСПОЛНЕНИЕ решения (endpoint -> событие и break;
             # segment -> фоновый stt)
             act = det.feed(pcm, rms=rms, t_ms=t_ms, stt_busy=stt_busy)
+            if act.is_voice:
+                # З1/M1: wall последнего голосового кадра -- каждый
+                # голосовой кадр перезаписывает, остаётся ПОСЛЕДНИЙ.
+                # Голос, досланный в хвосте ПОСЛЕ endpoint, кадрами не
+                # разбирается: там last_voice_at не обновляется
+                # (ограничение приёма, не телеметрии).
+                last_voice_at = time.perf_counter()
             if act.endpoint:
                 await ws.send_json({"event": "endpoint",
                                     "at_ms": int(det.endpoint_ms)})
@@ -398,6 +372,10 @@ async def ws_voice(ws: WebSocket) -> None:
             heard.append(tail_text)
         text = " ".join(heard).strip()
         total_ms = int((time.perf_counter() - t0) * 1000)
+        # З1: эта пре-ответная строка ОСТАВЛЕНА (решение исполнителя) --
+        # чекпоинт: если сессия упадёт в ответной фазе, услышанное и
+        # позиция endpoint видны по ней; полная телеметрия стадий --
+        # единый «ws_voice timing» в конце ответной фазы.
         log.info("ws_voice: endpoint=%d ms, stt_tail=%d ms, total=%d ms, "
                  "heard=%r -> %r", int(det.endpoint_ms), stt_ms, total_ms,
                  " ".join(heard), text)
@@ -411,27 +389,34 @@ async def ws_voice(ws: WebSocket) -> None:
                  "reply": "Не расслышал, повтори, пожалуйста.",
                  "confirm": False, "streamed": False})
             await ws.send_json({"event": "done"})
+            # З1: ответ был (пусть и «Не расслышал») -- телеметрия-строка
+            # тоже пишется; LLM-поля None: ответной фазы не было
+            _timing_line(text, chunks=0)
             return
 
-        # ---------------- ответ (фаза 6, п. 1; гейт задачи 16) --------
-        # Модель стримит предложения через on_sentence ПОКА решение ещё
-        # не готово: живьём телефон слышал «болтовню» модели («Ага,
-        # создал! ... Готово, держи!»), а после решения dispatch досыпал
-        # шаблон-фолбэк («Список «Вкусняшки» не найден») -- двойная
-        # озвучка с противоречивым текстом (phone.log 23:00:58-23:01:08).
-        # Структурный гейт (задача 16): стрим ГЛОТАЕТСЯ -- on_sentence
-        # остаётся (иначе answer ушёл бы в блокирующий decide() без
-        # first_token и спекулятивного prefetch поиска), но в TTS эти
-        # предложения НЕ идут. Озвучивается РОВНО ОДНА реплика --
-        # финальный reply (шаблон dispatch / вопрос-подтверждение /
-        # ответ модели), всегда ПОСЛЕ готовности решения.
+        # ---------------- ответ (фаза 6, п. 1; гейт озвучки З5) --------
+        # Гейт озвучки стрима -- класс StreamGate (voice_gate.py, Д1
+        # шаг 2): очередь сентенций + ОДИН воркер + правило ПРИ dequeue
+        # (action=none озвучивается, действия/unknown глотаются с latch,
+        # санитайзер на стриме) -- правило и его инварианты описаны в
+        # докстринге класса. Сюда -- только оркестрация: создать гейт,
+        # стартовать воркер, после _answer дренажировать сентинелом,
+        # дождаться воркера, финал -- gate.finish().
         loop = asyncio.get_running_loop()
+        # t_ask/first_ms/tts_first_ms объявлены в блоке телеметрии З1
+        # выше (ветка «Не расслышал» пишет строку до ответной фазы)
         t_ask = time.perf_counter()
-        first_ms: list[int] = []
-        tts_first_ms: list[int] = []
-
-        def _on_sentence(_s: str) -> None:
-            pass  # pre-decision chatter в TTS-канал не уходит (задача 16)
+        # Голос резолвится ОДИН раз на сессию (профиль не меняется в
+        # течение ответной фазы: профиль-команды обрабатываются раньше
+        # LLM-пути).
+        voice = llm.get_profile_voice()
+        # Инъекция в гейт: ws/voice/loop/tts (ленивый import выше) и
+        # телеметрия З1 -- holders tts_first_ms/audio_send_at (их пишет
+        # гейт, читает _timing_line).
+        gate = StreamGate(ws=ws, voice=voice, loop=loop, tts=tts_mod,
+                          t_ask=t_ask, tts_first_ms=tts_first_ms,
+                          audio_send_at=audio_send_at)
+        worker_task = gate.start_worker()
 
         def _on_first_token() -> None:
             first_ms.append(int((time.perf_counter() - t_ask) * 1000))
@@ -441,55 +426,29 @@ async def ws_voice(ws: WebSocket) -> None:
             # ещё дописывает ответ
             asyncio.run_coroutine_threadsafe(_prefetch_search(q), loop)
 
-        resp = await _answer(text, on_sentence=_on_sentence,
+        resp = await _answer(text, on_sentence=gate.on_sentence,
                              on_first_token=_on_first_token,
-                             on_query=_on_query)
+                             on_query=_on_query, on_action=gate.on_action)
+        # З1: стадия decision -- целиком _answer (от t_ask до возврата)
+        decision_ms = int((time.perf_counter() - t_ask) * 1000)
 
-        # Единственная озвучка -- финальная реплика: sentence + audio
-        # ДО reply-события (инвариант задач 14/16: телефон играет
-        # аудио-чанки по приходу и НЕ повторяет reply при
-        # streamed=true). Confirm-ворота needs_confirm/reply_replaced
-        # больше не разделяют ветки: reply уже финальный. Текст уже
-        # чист от мата: санитайзер задачи 21 в answer._answer (общий
-        # путь этого ws-endpoint); /confirm чистится явными вызовами
-        # sanitize_reply в server.py.
-        chunks_sent = 0
-        try:
-            wav = await asyncio.to_thread(tts_mod.synthesize, resp.reply,
-                                          llm.get_profile_voice())
-        except Exception:
-            log.warning("ws_voice: tts(final reply) failed", exc_info=True)
-            wav = b""
-        if wav:
-            if not tts_first_ms:
-                tts_first_ms.append(int((time.perf_counter() - t_ask)
-                                        * 1000))
-            chunks_sent += 1
-            await ws.send_json({"event": "sentence", "text": resp.reply})
-            await ws.send_json(
-                {"event": "audio",
-                 "b64": base64.b64encode(wav).decode("ascii")})
+        # LLM-стрим завершён: все сентенции уже в очереди (порядок
+        # call_soon_threadsafe FIFO -- завершение to_thread встало в
+        # очередь ПОСЛЕ enqueue'ов стрима). Сентинел -> воркер доест
+        # очередь и выйдет; ждём его, чтобы финал ушёл ПОСЛЕ чанков.
+        gate.stream_done()
+        await worker_task
+        worker_task = None   # обработан: в finally отменять нечего
 
-        # confirm/token -- телефону нужно для перехода в State.CONFIRM
-        # (как в POST /voice; без них ломалось подтверждение поиска/отправки)
-        # streamed=True: аудио финальной реплики уже ушло -- телефон НЕ
-        # озвучивает reply повторно (иначе двойная речь). При упавшем
-        # TTS streamed=False -- финальный reply скажет локальный TTS.
-        await ws.send_json({"event": "reply", "reply": resp.reply,
-                            "confirm": resp.needs_confirm,
-                            "token": resp.token,
-                            "streamed": chunks_sent > 0})
+        # Финал: три ветки по отправленным чанкам + reply-событие
+        # (voice_gate.StreamGate.finish; sentence+audio всегда РАНЬШЕ
+        # reply -- инвариант внутри finish).
+        await gate.finish(resp)
         await ws.send_json({"event": "done"})
-        # тайминги этапов (фаза 6, п. 7): llm первый токен, tts первого
-        # предложения, итог -- от них зависит задержка до первого звука
-        log.info("ws_voice: done in %d ms (first_token=%s, "
-                 "tts_first=%s, to_first_sound=%s, chunks=%d)",
-                 int((time.perf_counter() - t0) * 1000),
-                 first_ms[0] if first_ms else None,
-                 tts_first_ms[0] if tts_first_ms else None,
-                 (first_ms[0] + tts_first_ms[0])
-                 if first_ms and tts_first_ms else None,
-                 chunks_sent)
+        # З1: единый телеметрия-лог ws-ответа -- заменяет прежнюю строку
+        # «ws_voice: done in ...» (first_token/tts_first/итог -- внутри).
+        # chunks -- ВСЕ отправленные audio-события (чанки стрима + финал).
+        _timing_line(text, chunks=gate.chunks_sent)
     except Exception:
         try:
             await ws.send_json({"event": "error",
@@ -507,6 +466,13 @@ async def ws_voice(ws: WebSocket) -> None:
             seg_task.cancel()
             with suppress(asyncio.CancelledError):
                 await seg_task
+        # З5: обрыв сессии гасит воркер озвучки стрима -- как seg_task
+        # (to_thread не отменить: текущий синтез дозвучит в потоке, но
+        # его результат уже никому не отправится; задача завершается).
+        if worker_task is not None:
+            worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_task
         try:
             await ws.close()
         except Exception:  # noqa: BLE001

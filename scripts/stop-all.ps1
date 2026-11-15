@@ -13,6 +13,12 @@
     never touched. Stray duplicates of server.py / tts_kokoro_server.py /
     tts_silero_server.py are stopped too.
 
+    Step 0 (since 15.11.2026): the TTS watchdog (watch-tts.ps1) is
+    stopped FIRST -- while it lives it resurrects the silero sidecar
+    within ~3 poll intervals, so a plain "stop-all" would not stay
+    stopped. Its -Stop branch is quiet and exits 0 even when no
+    watchdog is running ("no watchdog process found" is not an error).
+
     Idempotent: things that are not running are reported as "not running".
     Run with -WhatIf to see what would be stopped without stopping it.
 
@@ -44,6 +50,19 @@ function Stop-Matching([string]$Label, [string]$ExeName, [string]$Pattern) {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# 0. TTS watchdog -- FIRST: otherwise it resurrects silero (8092) within
+#    ~3 poll intervals after this script stops the sidecar. Synchronous on
+#    purpose (the -Stop branch spawns nothing that could deadlock a pipe),
+#    quiet on purpose ("no watchdog process found" is normal).
+$WatchTts = Join-Path $PSScriptRoot 'watch-tts.ps1'
+if ($WhatIf) {
+    Write-Host '[stop] TTS watchdog : would stop first (scripts\watch-tts.ps1 -Stop)'
+} else {
+    Write-Host '[stop] TTS watchdog : stopping first (it would resurrect silero)'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File $WatchTts -Stop 2>$null | Out-Null
 }
 
 # 1. llama-server (LLM) -- by exe name only

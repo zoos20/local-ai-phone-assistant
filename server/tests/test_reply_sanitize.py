@@ -155,14 +155,20 @@ def _sentences(ws: StreamWS) -> list[str]:
 
 def _fake_stream(reply: str, action: str = "none", args: dict | None = None,
                  sentence: str | list[str] | None = None):
-    """Подмена llm.decide_stream: стримит предложение(я), отдаёт решение."""
+    """Подмена llm.decide_stream: отдаёт решение.
+
+    З4-контракт: факт action до первой сентенции (on_action ДО
+    on_sentence), как в реальном стриме.
+    """
     items = ([sentence] if isinstance(sentence, str)
              else list(sentence or []))
 
     def decide(text, history, on_sentence=None, on_first_token=None,
-               on_query=None):
+               on_query=None, on_action=None):
         if on_first_token is not None:
             on_first_token()
+        if on_action is not None:
+            on_action(action)
         if on_sentence is not None:
             for s in items:
                 on_sentence(s)
@@ -235,8 +241,9 @@ class TestSanitizeIntegration:
 
     def test_ws_sentence_audio_and_history_clean(self, voice_env,
                                                  monkeypatch):
-        # модель стримит болтовню и мат в финальном reply: гейт задачи 16
-        # болтовню глотает, единственная озвучка -- САНИТИЗИРОВАННЫЙ reply
+        # модель стримит болтовню с матом и мат в финальном reply: по З5
+        # санитайзер НА СТРИМЕ глотает болтовню (mute до конца стрима), а
+        # единственная озвучка -- САНИТИЗИРОВАННЫЙ финальный reply
         monkeypatch.setattr(llm, "decide_stream", _fake_stream(
             reply=LIVE_REGRESSION, action="none", args={},
             sentence="Бля, готовлюсь создать список."))

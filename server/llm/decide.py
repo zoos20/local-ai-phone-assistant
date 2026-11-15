@@ -20,11 +20,12 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент «Гемма»
 
 Отвечай ТОЛЬКО одним JSON-объектом. Без markdown, без пояснений, без текста вокруг. Схема:
 
-{"reply": "<текст для озвучки вслух>", "action": "<search|send_tg|send_vk|call|shopping_create|shopping_add|shopping_read|shopping_update|shopping_check|shopping_delete|shopping_lists|none>", "args": {...}}
+{"action": "<search|send_tg|send_vk|call|shopping_create|shopping_add|shopping_read|shopping_update|shopping_check|shopping_delete|shopping_lists|none>", "args": {...}, "reply": "<текст для озвучки вслух>"}
 
 Правила:
 - reply: 1-2 коротких предложения (до 25 слов) живым языком, их произнесут вслух. Развёрнутый ответ — только если просят прямо («расскажи подробнее», «подробнее»). Без ссылок, без разметки, без эмодзи.
 - action=search — нужен ответ из интернета. args: {"query": "<поисковый запрос на русском>"}.
+- Отвечай сам (action=none) на вопросы, ответ на которые есть в твоих общих знаниях: определения, биографии, исторические и научные факты, объяснения терминов («кто такой Пушкин», «что такое градусник»). action=search — только для АКТУАЛЬНЫХ данных, которых нет в твоих знаниях или они быстро меняются: погода, новости, курсы валют, расписание, цены, результаты матчей, «что происходит сейчас» — либо если ты честно не знаешь ответ.
 - action=send_tg — отправить сообщение в Telegram. args: {"to": "<имя или @username>", "message": "<текст сообщения>"}.
 - action=send_vk — отправить сообщение ВКонтакте. args: {"to": "<имя или id>", "message": "<текст сообщения>"}.
 - action=call — позвонить по телефону. args: {"contact": "<имя контакта из телефонной книги в ИМЕНИТЕЛЬНОМ падеже — «кто?»: Маша, а не Маше/Машу; либо сам номер, если его продиктовали>"}.
@@ -53,45 +54,50 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент «Гемма»
 - Никогда не добавляй ничего кроме JSON-объекта.
 
 Полезные примеры (формат, а не содержимое):
-{"reply": "Ищу погоду в Москве", "action": "search", "args": {"query": "погода Москва сегодня"}}
-{"reply": "Звоню Маше", "action": "call", "args": {"contact": "Маша"}}
-{"reply": "Кому отправить сообщение?", "action": "none", "args": {}}
+{"action": "search", "args": {"query": "погода Москва сегодня"}, "reply": "Ищу погоду в Москве"}
+{"action": "call", "args": {"contact": "Маша"}, "reply": "Звоню Маше"}
+{"action": "none", "args": {}, "reply": "Кому отправить сообщение?"}
+«Кто такой Пушкин?» — ответ из общих знаний, поиск НЕ нужен
+{"action": "none", "args": {}, "reply": "Пушкин — великий русский поэт XIX века, автор «Евгения Онегина»."}
+«Значит, кто такой Пушкин?» — префикс-связка не меняет маршрут: общие знания, поиск НЕ нужен
+{"action": "none", "args": {}, "reply": "Пушкин — великий русский поэт XIX века, автор «Евгения Онегина»."}
 
 Примеры со списками покупок (реплика пользователя -> JSON):
 «Создай список покупок на неделю: молоко два, яйца десяток»
-{"reply": "Список «Список покупок на неделю» готов: молоко и яйца.", "action": "shopping_create", "args": {"name": "Список покупок на неделю", "items": [{"text": "молоко", "qty": 2}, {"text": "яйца", "qty": "десяток"}]}}
+{"action": "shopping_create", "args": {"name": "Список покупок на неделю", "items": [{"text": "молоко", "qty": 2}, {"text": "яйца", "qty": "десяток"}]}, "reply": "Список «Список покупок на неделю» готов: молоко и яйца."}
 «Создай список покупок на неделю» (имя -- из слов пользователя)
-{"reply": "Создаю список «Список покупок на неделю».", "action": "shopping_create", "args": {"name": "Список покупок на неделю"}}
+{"action": "shopping_create", "args": {"name": "Список покупок на неделю"}, "reply": "Создаю список «Список покупок на неделю»."}
 «Добавь в список яйца»
-{"reply": "Добавляю яйца в список.", "action": "shopping_add", "args": {"items": [{"text": "яйца"}]}}
+{"action": "shopping_add", "args": {"items": [{"text": "яйца"}]}, "reply": "Добавляю яйца в список."}
 «В списке на неделю добавь сметану»
-{"reply": "Добавляю сметану в список на неделю.", "action": "shopping_add", "args": {"list": "На неделю", "items": [{"text": "сметана"}]}}
+{"action": "shopping_add", "args": {"list": "На неделю", "items": [{"text": "сметана"}]}, "reply": "Добавляю сметану в список на неделю."}
 «Хлеб и сахар» (сразу после вопроса «что добавить?»)
-{"reply": "Записываю хлеб и сахар.", "action": "shopping_add", "args": {}}
+{"action": "shopping_add", "args": {}, "reply": "Записываю хлеб и сахар."}
 «Что у меня по списку покупок?» (склонение -- имя «Список покупок»)
-{"reply": "Читаю список покупок.", "action": "shopping_read", "args": {"list": "Список покупок"}}
+{"action": "shopping_read", "args": {"list": "Список покупок"}, "reply": "Читаю список покупок."}
 «Что по на неделю?»
-{"reply": "Читаю список на неделю.", "action": "shopping_read", "args": {"list": "На неделю"}}
+{"action": "shopping_read", "args": {"list": "На неделю"}, "reply": "Читаю список на неделю."}
 «Какие списки у меня есть?»
-{"reply": "Перечисляю.", "action": "shopping_lists", "args": {}}
+{"action": "shopping_lists", "args": {}, "reply": "Перечисляю."}
 «Создаю ещё один список»
-{"reply": "Как назвать новый список?", "action": "none", "args": {}}
+{"action": "none", "args": {}, "reply": "Как назвать новый список?"}
 «Поменяй молоко на кефир»
-{"reply": "Меняю молоко на кефир.", "action": "shopping_update", "args": {"changes": [{"match": "молоко", "new_text": "кефир"}]}}
+{"action": "shopping_update", "args": {"changes": [{"match": "молоко", "new_text": "кефир"}]}, "reply": "Меняю молоко на кефир."}
 «Вычеркни хлеб»
-{"reply": "Отмечаю хлеб выполненным.", "action": "shopping_check", "args": {"items": [{"text": "хлеб"}]}}
+{"action": "shopping_check", "args": {"items": [{"text": "хлеб"}]}, "reply": "Отмечаю хлеб выполненным."}
 «Удали список на неделю»
-{"reply": "Удаляю список на неделю.", "action": "shopping_delete", "args": {"list": "На неделю"}}
+{"action": "shopping_delete", "args": {"list": "На неделю"}, "reply": "Удаляю список на неделю."}
 «Добавь в список» — не сказано, что именно; товары не выдумываем
-{"reply": "Что докупить? Назови товары и количество.", "action": "none", "args": {}}
+{"action": "none", "args": {}, "reply": "Что докупить? Назови товары и количество."}
 «Создай список покупок» — не назван ни один товар, ничего не придумываем
-{"reply": "Создаю список. Назови, что в него положить.", "action": "shopping_create", "args": {}}"""
+{"action": "shopping_create", "args": {}, "reply": "Создаю список. Назови, что в него положить."}"""
 
-# Дубликаты строк-реплик (backlog: дедуп после распила llm.py в пакет) --
-# текст побайтово идентичен прежним литералам, поведение не меняется.
+# Напоминание о схеме на повторной попытке (З4, вердикт A З3 13.11): порядок
+# ключей переставлен в {action, args, reply} -- как в SYSTEM_PROMPT
+# (action-first); тексты правил/реплик прежние.
 _SCHEMA_REMINDER = (
     "Отвечай ТОЛЬКО одним JSON-объектом по схеме "
-    "{reply, action, args}. Без текста вокруг. "
+    "{action, args, reply}. Без текста вокруг. "
     "И не упоминай в reply слова JSON, схема, "
     "формат -- отвечай как обычный голосовой "
     "собеседник."
@@ -419,7 +425,8 @@ def decide_stream(user_text: str,
                   *,
                   on_sentence=None,
                   on_first_token=None,
-                  on_query=None) -> Decision:
+                  on_query=None,
+                  on_action=None) -> Decision:
     """Стриминговый decide (фаза 6, п. 1): тот же результат, что и decide(),
     но reply уходит по предложениям через on_sentence, пока генерация ещё
     идёт (первый токен ~0.3-0.5 с вместо 1.5-8 с полного ответа).
@@ -429,7 +436,13 @@ def decide_stream(user_text: str,
                           потоке, очередь в asyncio);
     on_first_token()   -- первый токен content получен (замер таймингов);
     on_query(query)    -- поисковый запрос дописан целиком (спекулятивный
-                          старт поиска, п. 6).
+                          старт поиска, п. 6);
+    on_action(action)  -- значение action дописано (З4, гейт озвучки З5):
+                          при action-first промпте приходит ДО первой
+                          сентенции reply; только первая попытка стрима --
+                          повтор молчит (зеркально on_sentence). Работает
+                          на стриминговом пути: достаточно одного из
+                          on_sentence/on_action, чтобы попытка стримила.
     """
     messages = _decide_messages(user_text, history)
     log.info("LLM messages (stream): system=%d hist=%d user=%r",
@@ -441,7 +454,11 @@ def decide_stream(user_text: str,
 
     def _make_stream_chat(attempt: int):
         # Свежий парсер на каждую попытку: повтор -- новый ответ с нуля.
-        parser = _StreamParser(on_query)
+        # on_action -- только на первой попытке (зеркально стриму
+        # on_sentence ниже): вторая попытка молчит, гейт озвучки (З5)
+        # видит факт action только от первого стрима.
+        parser = _StreamParser(on_query,
+                               on_action=on_action if attempt == 0 else None)
         first = False
 
         def _stream(msgs: list[dict[str, str]]) -> str:
@@ -453,18 +470,23 @@ def decide_stream(user_text: str,
                     first = True
                     if on_first_token is not None:
                         on_first_token()
-                if on_sentence is not None:
-                    for sent in parser.feed(delta):
+                # Парсер кормится всегда на стрим-пути: даже без
+                # on_sentence он добывает факт action (on_action).
+                for sent in parser.feed(delta):
+                    if on_sentence is not None:
                         spoken.append(sent)
                         on_sentence(sent)
 
             # На второй попытке НЕ стримим: первая могла уже озвучить
             # часть реплики (см. is_committed) -- повтор идёт молча,
-            # озвучка пойдёт финальным событием на сервере.
-            if on_sentence is not None and attempt == 0:
+            # озвучка пойдёт финальным событием на сервере. Стрим-путь
+            # включается ради любого потребителя фактов (on_sentence
+            # и/или on_action).
+            if ((on_sentence is not None or on_action is not None)
+                    and attempt == 0):
                 raw = chat_stream(msgs, on_token=_on_token)
                 tail = parser.close()
-                if tail:
+                if tail and on_sentence is not None:
                     spoken.append(tail)
                     on_sentence(tail)
             else:

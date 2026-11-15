@@ -2,7 +2,9 @@
 """Распознавание речи: faster-whisper (офлайн, русский).
 
 Модель грузится лениво при первом обращении (~1-3 c на small/int8),
-чтобы сервер стартовал мгновенно.
+чтобы сервер стартовал мгновенно. При старте server.py дополнительно
+запускает прогрев stt.warmup() в фоновом потоке (З8а): ленивый путь
+срабатывает, только если прогрев не успел или провалился.
 """
 from __future__ import annotations
 
@@ -25,11 +27,33 @@ def _get_model():
         if _model is None:
             from faster_whisper import WhisperModel
 
-            log.info("загрузка whisper '%s' (int8, cpu)...", settings.whisper_model)
+            log.info("загрузка whisper '%s' (int8, cpu, threads=%d)...",
+                     settings.whisper_model, settings.whisper_cpu_threads)
+            # cpu_threads (З8а): настройка вычислений ctranslate2, не §7.
             _model = WhisperModel(settings.whisper_model, device="cpu",
-                                  compute_type="int8")
+                                  compute_type="int8",
+                                  cpu_threads=settings.whisper_cpu_threads)
             log.info("whisper готов")
         return _model
+
+
+def warmup() -> None:
+    """Прогрев STT при старте сервера (З8а, фича «мгновенный ответ»).
+
+    Загружает модель в фоновом потоке, чтобы ПЕРВАЯ фраза не платила
+    ~1.5 с загрузки (включая HTTP к huggingface за метаданными модели).
+    Провал прогрева (нет сети, битый кэш, OOM) НЕ должен мешать старту
+    сервера -- исключение глотается, ленивая загрузка через _get_model()
+    остаётся рабочим фолбэком при первой фразе.
+    """
+    log.info("whisper прогрев начат (модель '%s')", settings.whisper_model)
+    try:
+        _get_model()
+    except Exception:  # noqa: BLE001 -- прогрев не должен ронять сервер
+        log.warning("whisper прогрев провалился (попробуем при первой "
+                    "фразе)", exc_info=True)
+    else:
+        log.info("whisper прогрев готов")
 
 
 def _save_debug(audio: bytes) -> None:

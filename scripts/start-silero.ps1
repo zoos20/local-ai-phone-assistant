@@ -1,10 +1,29 @@
 # Starts the silero v5_6_ru TTS sidecar (port 8092, separate .venv-tts in <project>\server).
 # Stop: kill the python.exe process running tts_silero_server.py (stop-all.ps1 stops it too).
-# ASCII-only: a .ps1 saved without BOM is read as ANSI by PowerShell 5.1.
+#
+# stdout/stderr go to logs\tts_silero.stdout.log / logs\tts_silero.stderr.log
+# so a silent death (OOM kill, MemoryError traceback) leaves a trace on disk.
+# Start-Process cannot merge both streams into ONE file, hence two files.
+# Every start rotates the previous run to *.old.log (one .old generation,
+# no unbounded growth). Run only while the sidecar is NOT running: a live
+# process holds its log open (the rotation rename fails with a visible
+# error) and the duplicate would exit by itself (the sidecar checks port
+# 8092 before bind). ASCII-only on purpose: PowerShell 5.1 reads a BOM-less
+# .ps1 as ANSI, non-ASCII characters break the parser.
 $ScriptsDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $ServerDir  = Join-Path (Split-Path $ScriptsDir -Parent) 'server'
 $env:PYTHONUTF8 = '1'
+$LogDir = Join-Path $ServerDir 'logs'
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+foreach ($f in 'tts_silero.stdout.log', 'tts_silero.stderr.log') {
+    $p = Join-Path $LogDir $f
+    $old = $p -replace '\.log$', '.old.log'
+    if (Test-Path -LiteralPath $p) { Move-Item -LiteralPath $p -Destination $old -Force }
+}
 Start-Process -FilePath (Join-Path $ServerDir '.venv-tts\Scripts\python.exe') `
     -ArgumentList 'tts_silero_server.py' `
-    -WorkingDirectory $ServerDir -WindowStyle Hidden
+    -WorkingDirectory $ServerDir -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $LogDir 'tts_silero.stdout.log') `
+    -RedirectStandardError (Join-Path $LogDir 'tts_silero.stderr.log')
 Write-Output 'silero sidecar starting (port 8092), warmup ~15 s'
+Write-Output 'stdout/stderr: logs\tts_silero.stdout.log / logs\tts_silero.stderr.log'

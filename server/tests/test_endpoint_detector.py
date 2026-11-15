@@ -7,10 +7,11 @@ _WS_NO_VOICE_MS), сами пороги не трогаются.
 """
 from __future__ import annotations
 
-from voice_ws import (
+from endpointing import (
     _WS_BYTES_PER_MS,
     _WS_ECHO_START,
     _WS_NO_VOICE_MS,
+    _WS_QUIET_MS,
     EndpointDetector,
     FrameAction,
 )
@@ -55,38 +56,41 @@ class TestGraceAndNoVoiceTimeout:
 
 
 class TestQuietAfterVoice:
-    """armed -> пауза: сначала срез сегмента (stt на лету), потом endpoint."""
+    """armed -> тишина >= _WS_QUIET_MS -> endpoint.
 
-    def test_segment_then_endpoint(self):
+    З8 (15.11): _WS_QUIET_MS 1300 -> 900 -- порог закрытия сравнялся с
+    сегментным (_WS_SEG_QUIET_MS=900), а endpoint-правило проверяется
+    РАНЬШЕ сегментного: первый кадр тишины >= 900 мс закрывает приём,
+    сегмент в этот кадр не срезается (его целиком возьмёт финальный
+    tail-stt); stt_busy endpoint не задерживает.
+    """
+
+    def test_quiet_threshold_closes_input(self):
         det = EndpointDetector()
         # голос ПОСЛЕ grace -> armed
         act = det.feed(_pcm(3000), rms=VOICE_RMS, t_ms=3000.0, stt_busy=False)
         assert act.is_voice and det.armed
-        # тишина ровно _WS_SEG_QUIET_MS -> срез сегмента, endpoint ещё НЕТ
-        t1 = 3000.0 + 900
+        # тишина < _WS_QUIET_MS -> endpoint ещё НЕТ
+        t1 = 3000.0 + _WS_QUIET_MS - 1
         act = det.feed(_pcm(t1), rms=QUIET_RMS, t_ms=t1, stt_busy=False)
-        assert act.segment is not None and not act.endpoint
-        assert det.seg_start == len(_pcm(t1))
-        # тишина до _WS_QUIET_MS (900..1299) -> сегменты не режутся повторно
-        t2 = 3000.0 + 1200
-        act = det.feed(_pcm(t2), rms=QUIET_RMS, t_ms=t2, stt_busy=False)
         assert act.segment is None and not act.endpoint
         # тишина >= _WS_QUIET_MS -> endpoint (и сегмент в этот кадр не
-        # срезается: как и раньше, break до проверки сегмента)
-        t3 = 3000.0 + 1300
-        act = det.feed(_pcm(t3), rms=QUIET_RMS, t_ms=t3, stt_busy=False)
+        # срезается: break до проверки сегмента -- хвост целиком возьмёт
+        # финальный stt)
+        t2 = 3000.0 + _WS_QUIET_MS
+        act = det.feed(_pcm(t2), rms=QUIET_RMS, t_ms=t2, stt_busy=False)
         assert act.endpoint and act.segment is None
-        assert det.endpoint_ms == t3
+        assert det.endpointed and det.endpoint_ms == t2
 
-    def test_segment_cut_skipped_while_stt_busy(self):
+    def test_endpoint_not_blocked_by_stt_busy(self):
+        # endpoint-правило стоит РАНЬШЕ сегментной ветки и stt_busy не
+        # смотрит: на первом кадре тишины >= _WS_QUIET_MS приём
+        # закрывается, даже если фоновый stt занят (до З8 сегментный
+        # кадр при stt_busy откладывался -- теперь срез сегмента до
+        # endpoint не доходит вовсе)
         det = EndpointDetector()
         det.feed(_pcm(3000), rms=VOICE_RMS, t_ms=3000.0, stt_busy=False)
-        t = 3000.0 + 900
-        # фоновый stt ещё занят -> кадр не режется (параллельный инференс
-        # делил бы CPU whisper'а)
+        t = 3000.0 + _WS_QUIET_MS
         act = det.feed(_pcm(t), rms=QUIET_RMS, t_ms=t, stt_busy=True)
-        assert act.segment is None and not act.endpoint
-        # stt освободился -> тот же кадр даёт сегмент
-        act = det.feed(_pcm(t), rms=QUIET_RMS, t_ms=t, stt_busy=False)
-        assert act.segment is not None
-        assert det.seg_start == len(_pcm(t))
+        assert act.endpoint and act.segment is None
+        assert det.endpoint_ms == t

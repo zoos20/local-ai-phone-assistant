@@ -22,8 +22,9 @@ import java.util.concurrent.TimeUnit
  *                     затем {"event":"end"} (хватит слушать) или
  *                     {"event":"abort"} (стоп-слово -- молчим);
  *   сервер -> клиент: ready, endpoint (тишина -- закрывай запись),
- *                     hear (сегмент распознан на лету), reply (+confirm/
- *                     token), audio (wav ответа base64), done.
+ *                     hear (сегмент распознан на лету), sentence/audio
+ *                     (стрим-чанки), reply (+confirm/token; опц.
+ *                     reply_replaced=true -- финал заменён, З5/З6), done.
  *
  * Транспорт (план «гибридный туннель»):
  *  - [tunnel] == null -- прямой WS к LAN-серверу (HttpURLConnection-эпоха,
@@ -38,6 +39,15 @@ import java.util.concurrent.TimeUnit
 class VoiceStream(
     server: String,
     private val tunnel: TunnelClient? = null,
+    /** Режим endpointing (query ?prelude=, см. startVoiceStream):
+     *  true -- wake-режим (прелюдия = хвост «Геммы» + возможная пауза
+     *  до команды, защита grace, ?prelude=1); false -- follow-up
+     *  (команда без «Геммы», прелюдия = начало самой команды,
+     *  ?prelude=0). Оба режима передают параметр ЯВНО (Д4 -- режим
+     *  сессии виден в диагностике сервера); поведение прежнее: дефолт
+     *  сервера prelude=1, старый сервер неизвестный query-параметр
+     *  игнорирует. */
+    private val prelude: Boolean = true,
     private val onEvent: (Event) -> Unit,
 ) {
 
@@ -57,6 +67,11 @@ class VoiceStream(
             val audio: ByteArray?,
             /** Аудио-чанки уже играют/играли -- reply НЕ озвучивать. */
             val streamed: Boolean = false,
+            /** З5: сервер заменил reply (dispatch-фолбэк/санитайзер) при
+             *  отправленных чанках -- телефон (З6) гасит очередь чанков
+             *  и озвучивает финал ровно один раз. Отсутствие поля в
+             *  reply-событии -> false (старый сервер, прежнее поведение). */
+            val replaced: Boolean = false,
         ) : Event()
 
         object Failed : Event()
@@ -65,6 +80,29 @@ class VoiceStream(
     companion object {
         private const val TAG = "VoiceStream"
         private const val MAX_QUEUED = 1000    // ~100 с записи до ready
+
+        /** Полный URL WS /ws_voice для прямого LAN-подключения: схема
+         *  http/https -> ws/wss, токен (?token=, если есть) и ЯВНЫЙ
+         *  режим endpointing (?prelude=1 wake / =0 follow-up, Д4 --
+         *  режим сессии виден в диагностике; дефолт сервера «1», так
+         *  что поведение не меняется). Чистая функция -- под
+         *  unit-тест (VoiceStreamUrlTest). */
+        fun wsVoiceUrl(server: String, token: String, prelude: Boolean): String {
+            val base = server.trimEnd('/')
+                .replaceFirst("http://", "ws://")
+                .replaceFirst("https://", "wss://") + "/ws_voice"
+            val t = token.trim()
+            val withTok = if (t.isEmpty()) base
+            else base + "?token=" + URLEncoder.encode(t, "UTF-8")
+            val sep = if (t.isEmpty()) "?" else "&"
+            return withTok + sep + "prelude=" + (if (prelude) "1" else "0")
+        }
+
+        /** Путь сабстрима /ws_voice внутри туннеля (токен в путь
+         *  дописывает tunnel.py: sep = «&», если в пути уже есть «?») --
+         *  тоже с ЯВНЫМ режимом endpointing (Д4). */
+        fun tunnelVoicePath(prelude: Boolean): String =
+            "/ws_voice" + (if (prelude) "?prelude=1" else "?prelude=0")
     }
 
     @Volatile var ready = false
@@ -89,7 +127,12 @@ class VoiceStream(
             client = null
             ws = null
             AppLog.i(TAG, "connect via tunnel")
-            voiceHandle = t.openVoice("/ws_voice", object : TunnelClient.VoiceCb {
+            // query в пути допустим: tunnel.py добавляет токен с «&»,
+            // если в пути уже есть «?» (sep = "&" if "?" in path);
+            // режим endpointing передаём ЯВНО (Д4)
+            voiceHandle = t.openVoice(
+                tunnelVoicePath(prelude),
+                object : TunnelClient.VoiceCb {
                 override fun onText(text: String) {
                     try {
                         handle(JSONObject(text))
@@ -120,14 +163,21 @@ class VoiceStream(
             // принимает WS только с ?token= -- как и туннельный сабстрим
             // (там token дописывает tunnel.py). Без параметра -- 403
             // «bad token» и молчаливый фолбэк на телефоне.
-            val base = server.trimEnd('/')
-                .replaceFirst("http://", "ws://")
-                .replaceFirst("https://", "wss://") + "/ws_voice"
             val tok = ServerClient.token.trim()
-            val wsUrl = if (tok.isEmpty()) base
-            else base + "?token=" + URLEncoder.encode(tok, "UTF-8")
+            // follow-up (команда без «Геммы»): прелюдия = начало самой
+            // команды, защита паузы «до команды» не нужна -> prelude=0.
+            // Wake-режим: prelude=1 ЯВНО (Д4 -- режим сессии виден в
+            // диагностике; сервер и так дефолтит «1» -> поведение
+            // прежнее). Совместимость: старый сервер неизвестный
+            // query-параметр игнорирует, старый APK параметр не шлёт ->
+            // оба случая = прежнее поведение (деградации нет).
+            val wsUrlFull = wsVoiceUrl(server, tok, prelude)
             // URL в лог НЕ в полном виде: с токеном он утекает в logcat.
-            AppLog.i(TAG, "connect $base${if (tok.isEmpty()) "" else " (auth)"}")
+            AppLog.i(
+                TAG,
+                "connect ${wsUrlFull.substringBefore('?')}" +
+                    (if (tok.isEmpty()) "" else " (auth)"),
+            )
             val c = OkHttpClient.Builder()
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)   // long-poll живёт вечно
@@ -135,7 +185,7 @@ class VoiceStream(
                 .build()
             client = c
             ws = c.newWebSocket(
-                Request.Builder().url(wsUrl).build(),
+                Request.Builder().url(wsUrlFull).build(),
                 object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         AppLog.i(TAG, "open")
@@ -201,6 +251,9 @@ class VoiceStream(
                 token = r.optString("token").takeIf { it.isNotEmpty() },
                 audio = audio,
                 streamed = r.optBoolean("streamed"),
+                // опц. поле З5: true ТОЛЬКО при отправленных чанках и
+                // замене reply; старый сервер без поля -> false
+                replaced = r.optBoolean("reply_replaced"),
             ),
         )
         return true

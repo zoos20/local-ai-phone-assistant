@@ -27,7 +27,7 @@
   запросы в течение короткого окна после ответа.
 - **Профили характера с голосами** (переключение голосом: «профиль цундере»):
 
-  | Профиль | silero (основной) | kokoro (страховка) | Piper-фолбэк | Пол |
+  | Профиль | silero (основной) | kokoro (запасной) | Piper-фолбэк | Пол |
   |---|---|---|---|---|
   | Цензурный | eugene | dima | denis | мужской |
   | Нецензурный | aidar | dima | denis | мужской |
@@ -74,10 +74,12 @@ android/                клиент-приложение (Kotlin, foreground se
   app/src/main/assets/  голосовая модель Vosk (zip + лицензия Apache 2.0)
   app/src/test/         юнит-тесты (распознавание, фонетика, RMS, wake...)
 scripts/                скрипты запуска/настройки (PowerShell):
-  start-all.ps1           автозапуск стека (llama-server + server.py + silero-TTS + tunnel)
-  stop-all.ps1            остановка всего стека (8080/8090/8091/8092/8443, есть -WhatIf)
+  start-all.ps1           автозапуск стека (llama-server + server.py + silero-TTS + tunnel + TTS-watchdog)
+  stop-all.ps1            остановка всего стека (8080/8090/8091/8092/8443, есть -WhatIf; TTS-watchdog глушит первым)
   start-silero.ps1        запуск silero-TTS-sidecar (8092; прогрев ~15 с)
-  start-kokoro.ps1        запуск kokoro-sidecar вручную (страховка, 8091)
+  start-kokoro.ps1        запуск kokoro-sidecar вручную (запасной движок, 8091)
+  watch-tts.ps1           watchdog silero-TTS: health-poll каждые 60 с, 3 деградации → рестарт через start-silero.ps1
+                          (лог logs/tts_watchdog.log + .pid; -AlsoPort 8091 — monitor-only, -Once/-Stop для тестов)
   setup-tts-ab.ps1        разовый: окружение .venv-ab для A/B-харнесса TTS
   run-tts-ab.ps1          исследовательский A/B-прогон TTS-движков (инструмент выбора движка)
   setup-firewall.ps1      разовый: правила фаервола 8090 (LAN) и 8443 (туннель) (админ)
@@ -95,7 +97,9 @@ server/                 Python-часть (здесь же .env, окружен�
   decide.py               маршрутизация решения (decide/decide_stream, профили)
   app_state.py            глобальное состояние: история, pending, prefetch, профиль
   dispatch.py             ветвление команд: текст/голос/подтверждение
-  voice_ws.py             WS-стриминг аудио /ws_voice (endpointing, сегменты)
+  voice_ws.py             WS-стриминг аудио /ws_voice (стрим-гейт, телеметрия; пороги/детектор — в endpointing.py)
+  endpointing.py          пороги _WS_* (единственный источник) + EndpointDetector (?prelude-режимы)
+  voice_gate.py           StreamGate — гейт озвучки стрима (latch/mute/дренаж очереди предложений)
   profile_detect.py       распознавание команды смены профиля (+ fuzzy)
   api_models.py           pydantic-модели запросов/ответов
   dialog_state.py         конечный автомат диалога сервера
@@ -109,15 +113,15 @@ server/                 Python-часть (здесь же .env, окружен�
     stream_parser.py        парсер SSE-стрима
     _time.py                ретраи/таймауты
   stt.py                  распознавание речи (faster-whisper, CPU, int8)
-  tts.py                  озвучка: silero через sidecar (основной), kokoro (страховка), фолбэк Piper
+  tts.py                  озвучка: silero через sidecar (основной; фолбэк — Piper прямой), kokoro — запасной движок по настройке
   tts_silero_server.py    sidecar silero v5_6_ru на 8092 (.venv-tts, 48 кГц, ru-normalizr внутри)
-  tts_kokoro_server.py    sidecar kokoro-ru на 8091 (страховка; отдельное окружение .venv-tts)
+  tts_kokoro_server.py    sidecar kokoro-ru на 8091 (запасной движок, ручной запуск; отдельное окружение .venv-tts)
   tts_ab/                 A/B-харнесс TTS-движков (исследовательский CLI; данные в data/tts_ab, вне git)
   tools.py                действия: поиск, Telegram, VK, звонки
   shopping_store.py       списки покупок: хранение data/shopping_lists.json
   config.py               настройки из .env (префикс ASSISTANT_)
   login_tg.py             разовый вход в Telegram (Telethon user session)
-  tests/                  pytest: 487 тестов (endpointing, decide, списки покупок, обновление APK...)
+  tests/                  pytest: 526 тестов (endpointing, decide, списки покупок, обновление APK...)
   pyproject.toml          ruff + pytest-конфигурация
   requirements.txt        зависимости основного окружения
   requirements-dev.txt    dev-зависимости (pytest, ruff)
@@ -140,11 +144,11 @@ Python-модули лежат плоско внутри `server/` (плоски
 
 ```powershell
 # Python (в server/, нужен dev-окружение: pip install -r requirements-dev.txt)
-.venv\Scripts\python.exe -m pytest -q      # 487 тестов
+.venv\Scripts\python.exe -m pytest -q      # 526 тестов
 .venv\Scripts\python.exe -m ruff check .   # линтер
 
 # Android (в android/)
-.\gradlew.bat testDebugUnitTest            # 236 юнит-тестов
+.\gradlew.bat testDebugUnitTest            # 243 юнит-теста
 .\gradlew.bat assembleDebug
 ```
 
@@ -181,7 +185,7 @@ python -m venv .venv
 python -m venv .venv-tts
 .venv-tts\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv-tts\Scripts\pip install numpy soundfile omegaconf ru-normalizr
-#    kokoro-ru (страховка, по желанию):
+#    kokoro-ru (запасной движок, по желанию):
 .venv-tts\Scripts\pip install kokoro phonopy pyyaml  # см. scripts\start-kokoro.ps1
 
 # 4. Голоса Piper (фолбэк озвучки)
@@ -484,6 +488,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-apk.ps1
 - сборка **debug** и подписана debug-ключом: поверх установленной сборки
   Android ставит только APK с тем же ключом подписи — если телефон и ПК
   собираются разными debug-ключами, установка поверх откажется;
+- текущая версия APK: **0.5** (versionCode 5);
 - APK ~69 МБ — внутрь встроена голосовая модель Vosk;
 - каталог `releases/` не попадает в git — это локальные артефакты ПК;
 - обновление работает только по LAN (см. выше), через туннель — нет;
@@ -822,12 +827,13 @@ curl -k "https://<ddns>:8443/health"                    # снаружи (IPv6 �
 | `FOLLOWUP_START_MS` / `FOLLOWUP_TRIG_MS` | 5 000 / 300 | follow-up запросы после ответа |
 | `MAX_FOLLOWUP` | 10 | максимум follow-up подряд |
 
-Сервер (`server.py`, конвенции `/ws_voice`):
+Сервер (`endpointing.py` — единственный источник порогов `_WS_*` после
+распила Д1; `_WS_ACTIVE` — мутабельный счётчик сессий в `voice_ws.py`):
 
 | Константа | Значение | Назначение |
 |---|---|---|
-| `_WS_QUIET_MS` | 1 300 | тишина, после которой фраза считается сказанной |
-| `_WS_SEG_QUIET_MS` | 900 | пауза между сегментами в предложении |
+| `_WS_QUIET_MS` | 900 | тишина, после которой фраза считается сказанной (было 1300 — З8 15.11, −~400 мс до ответа) |
+| `_WS_SEG_QUIET_MS` | 900 | пауза → сегмент закрыт (сегментная ветка сейчас недостижима: порог сравнялся с `_WS_QUIET_MS`, endpoint проверяется раньше — мёртвый код-хвост) |
 | `_WS_GRACE_MS` | 2 500 | льготное окно после «конца» фразы |
 | prefetch-поиск | TTL 180 с / таймаут 15 с | спекулятивный поиск по `query` из LLM |
 

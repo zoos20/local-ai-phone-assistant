@@ -22,15 +22,23 @@ log = logging.getLogger("assistant")
 async def _answer(text: str,
                   on_sentence=None,
                   on_first_token=None,
-                  on_query=None) -> AskResponse:
+                  on_query=None,
+                  on_action=None) -> AskResponse:
     """Общая цепочка: текст -> решение модели -> действие -> ответ.
 
     on_sentence/on_first_token/on_query (фаза 6, п. 1) -- включают
     стриминговый путь decide_stream: предложения reply отдаются
     консумеру, пока генерация ещё идёт (первый токен ~0.3-0.5 с вместо
     ожидания полного ответа). /ask его не подключает (блокирующий
-    decide()); /ws_voice подключает, но с гейта задачи 16 mid-stream
-    предложения в TTS НЕ идут -- озвучивается только финальный reply.
+    decide()); /ws_voice подключает: с З5 mid-stream сентенции
+    ОЗВУЧИВАЮТСЯ по мере прихода при action=none и глотаются при
+    действиях (гейт озвучки в voice_ws, факт action -- по on_action
+    ниже; при не-заменённых чанках финальный audio не досылается --
+    он уже звучал чанками).
+    on_action (З4, вердикт A З3) -- факт action для гейта озвучки (З5):
+    при action-first промпте приходит ДО первой сентенции reply;
+    пробрасывается в decide_stream, только если консумер его подключил
+    (/ask не подключает; /ws_voice подключает -- З5).
     """
     t0 = time.perf_counter()
     log.info("ask: %r", text)
@@ -112,8 +120,13 @@ async def _answer(text: str,
                     log.warning("on_first_token failed", exc_info=True)
 
         def _run() -> llm.Decision:
+            # on_action (З4) -- опциональный kwarg: пробрасываем, только
+            # если консумер подключил колбэк (иначе вызов байт-в-байт
+            # прежний, в т.ч. для подмен decide_stream в тестах).
+            extra = {} if on_action is None else {"on_action": on_action}
             return llm.decide_stream(text, history, on_sentence=_on_sentence,
-                                     on_first_token=_first, on_query=on_query)
+                                     on_first_token=_first, on_query=on_query,
+                                     **extra)
 
         try:
             decision = await asyncio.to_thread(_run)
@@ -143,10 +156,12 @@ async def _answer(text: str,
     # через on_sentence: dispatch заменяет её фолбэком-уточнением (нет
     # активного списка / неоднозначное имя — задача 14, критерий S8) либо
     # возвращает детерминированный шаблон (чтение/эхо списков — S3).
-    # Флаг reply_replaced -- ИНФОРМАЦИОННЫЙ (закреплён тестами): после
-    # задачи 16 voice_ws синтезирует финальный reply БЕЗУСЛОВНО после
-    # готовности решения (mid-stream болтовня в TTS не уходит вовсе),
-    # так что гейт на этом поле больше не ветвит логику; /ask поле
+    # Флаг reply_replaced -- ИНФОРМАЦИОННЫЙ (закреплён тестами) и с З5
+    # РАБОЧИЙ сигнал для voice_ws: если при УЖЕ отправленных стрим-чанках
+    # итоговый reply заменили (dispatch/санитайзер), voice_ws досылает
+    # финальные sentence+audio и ставит в reply-событии опц. поле
+    # reply_replaced=true (контракт З6: телефон гасит очередь чанков и
+    # играет финал; отсутствие поля = старое поведение); /ask поле
     # отсекает через response_model=AskResponse. Формат истории НЕ
     # меняется: _history_digest(decision, reply) работает с тем же
     # decision.

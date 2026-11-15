@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -39,6 +40,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 import llm
 import shopping_store
+import stt
 import tools
 from answer import _answer
 from api_models import (
@@ -168,6 +170,13 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """
     global _keepalive_task
     _keepalive_task = asyncio.create_task(_llm_keepalive_beat())
+    # Прогрев STT в фоне (З8а, фича «мгновенный ответ»): первая фраза не
+    # платит ~1.5 с загрузки whisper (включая HTTP к huggingface за
+    # метаданными модели). Поток daemon=True и НЕ дожидается -- поднятие
+    # порта не блокируется; провал прогрева безопасен (stt.warmup глотает
+    # исключение), ленивая загрузка _get_model() остаётся фолбэком.
+    threading.Thread(target=stt.warmup, name="stt-warmup",
+                     daemon=True).start()
     try:
         yield
     finally:

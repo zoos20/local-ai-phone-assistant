@@ -6,11 +6,16 @@ from typing import Any
 log = logging.getLogger("assistant.llm")
 
 # --- потоковый разбор ответа модели (фаза 6, п. 1) -------------------------
-# Модель отвечает JSON {"reply": "...", ...}: поле reply идёт ПЕРВЫМ, и его
-# можно озвучивать ПО МЕРЕ поступления токенов, не дожидаясь конца генерации
-# (действия/args дождутся конца). Инкрементальный парсер вырезает готовые
-# предложения из частично накопленной строки reply.
+# Модель отвечает JSON; с З4 (вердикт A З3 13.11) промпт action-first: схема
+# {"action": ..., "args": ..., "reply": ...} -- значение action дописывается
+# ещё ДО открытия reply, и гейт озвучки (З5) знает вердикт до первой
+# сентенции. Старый порядок {reply, ..., action} парсер тоже принимает
+# (толерантен к порядку ключей). Поле reply озвучивается ПО МЕРЕ поступления
+# токенов, не дожидаясь конца генерации (действия/args дождутся конца).
+# Инкрементальный парсер вырезает готовые предложения из частично
+# накопленной строки reply.
 _REPLY_KEY_RE = re.compile(r'"reply"\s*:\s*"')
+_ACTION_KEY_RE = re.compile(r'"action"\s*:\s*"')
 _QUERY_KEY_RE = re.compile(r'"query"\s*:\s*"')
 # конец предложения: . ! ? … (+ возможная закрывающая кавычка) + пробел/конец
 _SENT_END_RE = re.compile(r"[.!?…][»\"]?(?=\s|$)")
@@ -22,18 +27,24 @@ class _StreamParser:
     feed(delta) -> list[полных предложений]; close() -> хвост (последнее
     предложение без финальной пунктуации). on_query вызывается один раз,
     когда строка query полностью дописана (speculative-поиск, п. 6).
+    on_action вызывается один раз, когда значение action полностью дописано
+    (З4, гейт озвучки З5); атрибут action заполняется сразу, работает в
+    обоих порядках ключей (action-first и старый reply-first).
     """
 
-    def __init__(self, on_query=None) -> None:
+    def __init__(self, on_query=None, on_action=None) -> None:
         self._raw = ""            # весь сырой поток
         self._reply_raw = ""      # накопленный текст ВНУТРИ строки reply
         self._reply_open = False  # нашли начало "reply": "
         self._reply_closed = False
         self._emitted = 0         # сколько символов reply уже отдано
         self._query_done = False
+        self._action_done = False
         self._on_query = on_query
+        self._on_action = on_action
         self.reply_text = ""      # декодированный reply (для фолбэков)
         self.spoken = ""          # всё, что уже отдано на озвучку (для is_committed)
+        self.action: str | None = None  # факт action (З4), как только дописан
 
     @staticmethod
     def _decode(s: str) -> str:
@@ -69,16 +80,20 @@ class _StreamParser:
 
     def feed(self, delta: str) -> list[str]:
         if self._reply_closed:
-            # reply уже дописан, но query (action/args идут ПОСЛЕ reply)
-            # может появиться позже -- продолжаем следить
+            # reply уже дописан, но action (может идти и ПОСЛЕ reply --
+            # старый порядок ключей) и query могут появиться позже --
+            # продолжаем следить
             self._raw += delta
+            self._maybe_action()
             self._maybe_query()
             return []
         self._raw += delta
         if not self._reply_open:
             m = _REPLY_KEY_RE.search(self._raw)
             if not m:
-                # заодно ловим полный query для speculative-поиска (п. 6)
+                # заодно ловим факт action (гейт З4) и полный query
+                # для speculative-поиска (п. 6)
+                self._maybe_action()
                 self._maybe_query()
                 return []
             self._reply_open = True
@@ -101,8 +116,33 @@ class _StreamParser:
             if len(sent) >= 3:
                 out.append(sent)
                 self.spoken = (self.spoken + " " + sent).strip()
+        self._maybe_action()
         self._maybe_query()
         return out
+
+    def _maybe_action(self) -> None:
+        """Гейт озвучки (З4, вердикт A З3): как только значение action
+        дописано целиком. При action-first это происходит ДО открытия
+        reply (гейт З5 знает вердикт до первой сентенции); при старом
+        порядке -- после. Колбэк -- однократно, механика как у
+        _maybe_query."""
+        if self._action_done:
+            return
+        m = _ACTION_KEY_RE.search(self._raw)
+        if not m:
+            return
+        a = self._raw[m.end():]
+        end = self._closed_str_end(a)
+        if end < 0:
+            return
+        self._action_done = True
+        action = self._decode(a[:end]).strip()
+        self.action = action
+        if action and self._on_action is not None:
+            try:
+                self._on_action(action)
+            except Exception:  # noqa: BLE001 -- гейт не должен ломать стрим
+                log.exception("on_action callback failed")
 
     def _maybe_query(self) -> None:
         """Спекулятивный поиск (п. 6): как только query дописан целиком."""

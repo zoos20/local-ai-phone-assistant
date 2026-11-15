@@ -8,6 +8,7 @@
       3. silero TTS sidecar on port 8092        -> <project>\server\tts_silero_server.py
                                                    (.venv-tts, mirror of stop-all.ps1)
       4. tunnel (wss, TLS + token) on port 8443 -> <project>\server\tunnel.py
+      5. TTS watchdog (hidden)                 -> <project>\scripts\watch-tts.ps1
 
     Layout: python code + .venv + .env live in <project>\server\,
     this script lives in <project>\scripts\.
@@ -24,6 +25,11 @@
 
     NOTE: if 127.0.0.1:8080 is owned by another local service, the model
     health check must go through the LAN IP (same rule as switch-model.ps1).
+
+    NOTE: the TTS watchdog (item 5, since 15.11.2026) is idempotent by
+    itself: it has a single-instance guard and logs
+    "watchdog-already-running" if a second instance is attempted -- that
+    outcome is normal, not an error.
 
     ASCII-only on purpose: a .ps1 saved without BOM is read as ANSI by
     PowerShell 5.1, and non-ASCII characters in it break the parser.
@@ -116,9 +122,21 @@ if (Test-Health 'http://127.0.0.1:8092/health') {
     Write-Host "[autostart] silero TTS process already running (warming up) -- skip"
 } elseif (Test-Path $TtsPython) {
     Write-Host "[autostart] starting silero TTS sidecar (warmup ~15 s)..."
+    # Rotate + redirect exactly like start-silero.ps1: a silent sidecar death
+    # (OOM kill, MemoryError traceback) must leave a trace on disk no matter
+    # which script started it. Two files: Start-Process cannot merge streams.
+    $TtsLogDir = Join-Path $ServerDir 'logs'
+    New-Item -ItemType Directory -Force -Path $TtsLogDir | Out-Null
+    foreach ($f in 'tts_silero.stdout.log', 'tts_silero.stderr.log') {
+        $p = Join-Path $TtsLogDir $f
+        $old = $p -replace '\.log$', '.old.log'
+        if (Test-Path -LiteralPath $p) { Move-Item -LiteralPath $p -Destination $old -Force }
+    }
     Start-Process -FilePath $TtsPython `
         -ArgumentList 'tts_silero_server.py' -WorkingDirectory $ServerDir `
-        -WindowStyle Hidden | Out-Null
+        -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $TtsLogDir 'tts_silero.stdout.log') `
+        -RedirectStandardError (Join-Path $TtsLogDir 'tts_silero.stderr.log') | Out-Null
 } else {
     Write-Host "[autostart] $TtsPython not found -- TTS NOT started (voice falls back to piper)"
 }
@@ -137,6 +155,21 @@ if (Test-Tcp '127.0.0.1' 8443) {
         -WindowStyle Hidden | Out-Null
 } else {
     Write-Host "[autostart] $Python not found -- tunnel NOT started"
+}
+
+# --- 5. TTS watchdog (silero :8092, tech debt D2) ---------------------------
+# Restarts the silero sidecar after silent deaths (OOM kill / MemoryError
+# leave no traceback anywhere; stdout/stderr redirects only record it).
+# Hidden window like every other component here. Idempotent: the script
+# has its own single-instance guard, so "watchdog-already-running" is a
+# normal, non-blocking outcome of re-running start-all.
+$WatchTts = Join-Path $ScriptsDir 'watch-tts.ps1'
+if (Test-Path $WatchTts) {
+    Write-Host "[autostart] starting TTS watchdog (watch-tts.ps1)..."
+    Start-Process powershell.exe -WindowStyle Hidden `
+        -ArgumentList '-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', $WatchTts | Out-Null
+} else {
+    Write-Host "[autostart] $WatchTts not found -- TTS watchdog NOT started"
 }
 
 Write-Host "[autostart] done"

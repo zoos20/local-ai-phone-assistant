@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # --- Голос (фаза 2) ---
     # Модель faster-whisper: small — быстрее, medium — точнее на русском
     whisper_model: str = "small"
+    # Потоки ctranslate2 для whisper (З8а): 6 = физические ядра машины
+    # (6C/12T); все 12 логических дают оверсубскрипт со стеком
+    # llama+TTS. Значение выверим живым замером stt_total_ms (З8а,
+    # до/после на тех же фразах); это НАСТРОЙКА вычислений, а НЕ
+    # тайминговая константа §7.
+    whisper_cpu_threads: int = 6
     # Голос Piper из models/ (ru_RU-irina-medium | ru_RU-ruslan-medium ...)
     tts_voice: str = "ru_RU-denis-medium"
     # Движок озвучки (выбор 12.11.2026 по A/B-харнессу + слепой

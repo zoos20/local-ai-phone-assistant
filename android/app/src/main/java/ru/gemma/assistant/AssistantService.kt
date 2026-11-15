@@ -368,13 +368,44 @@ class AssistantService : Service() {
     @Volatile private var streamStreamed = false
     /** Хотя бы один чанк приходил (фолбэк POST /voice не дублирует речь). */
     @Volatile private var streamChunkSeen = false
+    /** З6: сервер заменил reply при отправленных чанках (reply_replaced
+     *  -- dispatch-фолбэк/санитайзер): очередь чанков гасится, финал
+     *  озвучивается ровно один раз (см. finishStreamReply). */
+    @Volatile private var streamReplaced = false
+    /** Номер чанка текущей сессии -- метка M3 в phone.log (З6). */
+    @Volatile private var streamChunkSeq = 0
     // Очередь WAV-чанков стриминговой озвучки (фаза 6, п. 1): игрок берёт
     // по мере готовности, пока chunkStreamDone не придёт финал (reply).
     // Монитор -- java.lang.Object (у Kotlin-Any нет wait/notify).
     private val chunkLock = java.lang.Object()
-    private val chunkQueue = ArrayDeque<ByteArray>()
+    private val chunkQueue = ArrayDeque<Chunk>()
     @Volatile private var chunkStreamDone = false
     @Volatile private var chunkPlayerRunning = false
+    // --- фикс гонки двойной озвучки финала (QA З6) ---------------------
+    // Финальный серверный WAV (контракт З5: sentence+audio уходят ДО
+    // reply-события) встаёт в очередь, когда игрок простаивает в
+    // chunkLock.wait; enqueue будит игрока, и он может вынести финал ДО
+    // clear'а Reply-ветки -- тогда финал уже звучит серверным голосом и
+    // локальный speak() задваивал бы его. Игрок отмечает seq взятого
+    // чанка, finishStreamReply сравнивает его с seq последнего
+    // поставленного в очередь -- решение детерминировано монитором
+    // chunkLock, а не окном между потоками.
+    /** Seq последнего чанка, ВЗЯТОГО игроком из очереди. Пишется игроком
+     *  ПОД chunkLock вместе с выносом (атомарно относительно clear'а
+     *  Reply-ветки) и после проигрывания НЕ сбрасывается: решению важен
+     *  «последний взятый», а не «сейчас играющий» -- финал мог дозвучать
+     *  до проверки, сброс давал бы ложное «не взят» => двойная озвучка.
+     *  0 -- игрок в этой сессии ещё ничего не брал. */
+    @Volatile private var chunkPlayingSeq = 0
+    /** Seq последнего чанка, ПОСТАВЛЕННОГО в очередь (пишется под
+     *  chunkLock вместе с addLast; в replaced-потоке это seq финального
+     *  WAV -- опорная точка сравнения в finishStreamReply). */
+    @Volatile private var chunkLastEnqSeq = 0
+
+    /** WAV-чанк с номером сессии: seq нужен игроку, чтобы отметить
+     *  взятый чанк (детерминированная проверка финала, фикс З6). */
+    private class Chunk(val seq: Int, val wav: ByteArray)
+
     // wav команды на случай обрыва стрима после «end» (фолбэк POST /voice)
     @Volatile private var pendingWav: ByteArray? = null
 
@@ -789,8 +820,11 @@ class AssistantService : Service() {
                 // потоковый канал (фаза 6, п. 1): prelude теми же
                 // байтами уйдёт при ready, дальше -- кадры на лету;
                 // сервер сам слышит конец фразы (1.6 с тишины)
-                // вместо наших локальных QUIET_END_MS=3 с
-                startVoiceStream(snap.copyOfRange(from, snap.size))
+                // вместо наших локальных QUIET_END_MS=3 с.
+                // wake-режим (prelude=1, параметр не шлём): в прелюдии
+                // хвост «Геммы» и возможная пауза до команды --
+                // сервер не рвёт приём по тишине до grace
+                startVoiceStream(snap.copyOfRange(from, snap.size), wake = true)
                 session.commandStartMs = now
                 session.speechSeen = false
                 session.lastSpeechMs = 0L
@@ -1197,7 +1231,16 @@ class AssistantService : Service() {
                         COMMAND_PRELUDE_MS * SAMPLE_RATE * 2 / 1000
                     val from = maxOf(0, snap.size - preludeBytes)
                     session.commandBuf.write(snap, from, snap.size - from)
-                    startVoiceStream(snap.copyOfRange(from, snap.size))
+                    // follow-up (?prelude=0): «Геммы» не было, ring-буфер
+                    // очищен на входе в окно -> прелюдия = начало самой
+                    // команды, защита паузы «до команды» не нужна:
+                    // короткая фраза, целиком в прелюдии, закрывается по
+                    // тишине (конец голоса + 900 мс), а не по NO_VOICE
+                    // 5000 (живой диагноз 22:01: M1 4756 -> ~3700)
+                    startVoiceStream(
+                        snap.copyOfRange(from, snap.size),
+                        wake = false,
+                    )
                     session.commandStartMs = now
                     session.speechSeen = true
                     session.lastSpeechMs = now
@@ -1574,11 +1617,25 @@ class AssistantService : Service() {
     // Сеть + озвучка (scope, IO)
     // ------------------------------------------------------------------
     /**
-     * Открывает потоковый канал /ws_voice при wake-hit: prelude (хвост
-     * «Гемма» + начало команды из ring-буфера) уйдёт первым сообщением,
-     * дальше аудио-поток шлёт кадры на лету.
+     * Открывает потоковый канал /ws_voice: prelude (начало команды из
+     * ring-буфера) уйдёт первым сообщением, дальше аудио-поток шлёт
+     * кадры на лету.
+     *
+     * [wake] -- режим endpointing сервера (query ?prelude=):
+     *  - true -- стрим начат по wake-hit: в прелюдии хвост «Геммы» и
+     *    ВОЗМОЖНАЯ пауза до команды (1.5-2 с) -> prelude=1 (сервер не
+     *    рвёт приём по тишине до grace; дефолт -- параметр не шлём);
+     *  - false -- follow-up (openFollowUp): команда БЕЗ «Геммы», ring-
+     *    буфер очищен на входе в окно, прелюдия = начало самой команды
+     *    -> prelude=0: короткая фраза, целиком в прелюдии, закрывается
+     *    по тишине (конец голоса + 900 мс), а не по 5-секундному
+     *    NO_VOICE-таймауту «голоса не было» (живой диагноз 22:01:
+     *    M1 4756/4791 -> ~3700 мс).
+     * Подтверждения (CONFIRM) через /ws_voice НЕ слушаются -- локальный
+     * Vosk «да/отмена» + POST /confirm (ServerClient.confirm), поэтому
+     * им режим prelude не нужен вовсе.
      */
-    private fun startVoiceStream(prelude: ByteArray) {
+    private fun startVoiceStream(prelude: ByteArray, wake: Boolean = true) {
         try {
             voiceStream?.close()
         } catch (_: Exception) {
@@ -1590,14 +1647,26 @@ class AssistantService : Service() {
         streamAudio = null
         streamStreamed = false
         streamChunkSeen = false
+        streamReplaced = false
         synchronized(chunkLock) {
             chunkQueue.clear()
             chunkStreamDone = false
+            // сброс меток «взят/поставлен» игрока и счётчика M3 ПОД
+            // chunkLock (QA З6 + QA З7): инвариант «все пишущие держат
+            // монитор» (см. KDoc chunkPlayingSeq/chunkLastEnqSeq) --
+            // прежний сброс ВНЕ synchronized оставлял окно, где игрок
+            // старой сессии мог успеть перезаписать метку после сброса
+            chunkPlayingSeq = 0
+            chunkLastEnqSeq = 0
+            // сброс счётчика M3 под chunkLock: атомарен относительно
+            // инкремента в AudioChunk-ветке -- нумерация метки не рвётся
+            // при переключении сессий (QA З6)
+            streamChunkSeq = 0
         }
         // Туннель (план «гибридный туннель»): канал подключён -> голосовой
         // поток идёт сабстримом внутри WSS-сессии, иначе -- прямой WS по LAN
         val tunnel = if (TunnelClient.isOpen()) TunnelClient else null
-        voiceStream = VoiceStream(server, tunnel) { ev ->
+        voiceStream = VoiceStream(server, tunnel, prelude = wake) { ev ->
             when (ev) {
                 is VoiceStream.Event.Ready ->
                     AppLog.i(TAG, "stream ready")
@@ -1613,11 +1682,23 @@ class AssistantService : Service() {
                     // стриминговая озвучка (фаза 6): чанк -> в очередь,
                     // игрок играет по мере готовности (первый звук ~1-1.5 с)
                     streamChunkSeen = true
-                    synchronized(chunkLock) {
-                        chunkQueue.addLast(ev.wav)
+                    // seq захватывается ПОД chunkLock вместе с постановкой
+                    // в очередь: инкремент/чтение корректны при смене
+                    // сессии (сброс тоже под chunkLock), а chunkLastEnqSeq
+                    // -- опорная точка проверки финала в finishStreamReply
+                    val seq = synchronized(chunkLock) {
+                        streamChunkSeq += 1
+                        chunkLastEnqSeq = streamChunkSeq
+                        chunkQueue.addLast(Chunk(streamChunkSeq, ev.wav))
                         chunkLock.notifyAll()
+                        streamChunkSeq
                     }
                     startChunkPlayer()
+                    // M3-метка (фича «почти мгновенный голосовой ответ», З6):
+                    // приход чанка на телефоне; парится со строкой
+                    // "stream endpoint" в phone.log -- цель M3 <= 300 мс
+                    AppLog.i(TAG, "audio chunk #$seq " +
+                            "(${ev.wav.size} bytes)")
                 }
                 is VoiceStream.Event.Reply -> {
                     // финал сессии: ответ (+confirm/token/wav) -- озвучиваем
@@ -1627,7 +1708,38 @@ class AssistantService : Service() {
                     streamToken = ev.token
                     streamAudio = ev.audio
                     streamStreamed = ev.streamed
-                    if (ev.streamed) {
+                    streamReplaced = ev.replaced
+                    if (ev.replaced) {
+                        // З6 (stop-chunks): сервер заменил reply при
+                        // отправленных чанках (dispatch-фолбэк/санитайзер)
+                        // -- прозвучавшие чанки НЕ равны финалу -> гасим
+                        // очередь тем же монитором и уведомлением, что
+                        // Failed-ветка ниже (chunkStreamDone=true +
+                        // notifyAll), ПЛЮС clear(): Failed-ветка очередь
+                        // НЕ чистит (полученные до обрыва чанки валидны
+                        // -- дозвучивают), clear нужен только здесь
+                        // (чанки НЕ равны финалу); текущий WAV дозвучит
+                        // хвост чанка (сотни мс).
+                        // К этому моменту финал в одном из трёх состояний,
+                        // разрешает их finishStreamReply детерминированно:
+                        // 1) финальный WAV ещё В ОЧЕРЕДИ -> гасится этим
+                        //    clear'ом, финал скажет локальный TTS;
+                        // 2) финальный WAV уже ВЗЯТ игроком (ждал в
+                        //    chunkLock.wait и проснулся на notifyAll
+                        //    раньше этого clear'а) -> он звучит/дозвучал
+                        //    серверным голосом, локальный speak НЕ зовётся
+                        //    (иначе финал звучал бы дважды -- QA З6);
+                        // 3) финальный WAV не приходил вовсе (упал синтез
+                        //    финала: streamed=false) -> скажет локальный
+                        //    TTS.
+                        // speechInterrupted НЕ трогаем -- это семантика
+                        // стоп-слова/барж-ина.
+                        synchronized(chunkLock) {
+                            chunkQueue.clear()
+                            chunkStreamDone = true
+                            chunkLock.notifyAll()
+                        }
+                    } else if (ev.streamed) {
                         // чанки уже играют/играли -- закрываем очередь игрока
                         synchronized(chunkLock) {
                             chunkStreamDone = true
@@ -1687,11 +1799,28 @@ class AssistantService : Service() {
                 "(${FOLLOWUP_START_MS}ms) after $reason")
     }
 
+    /** Ждёт конца игрока чанков: выход по завершению игрока, стоп-слову
+     *  или дедлайну (тот же механизм, что был в streamed-ветке
+     *  finishStreamReply; новых таймингов не вводит). */
+    private fun awaitChunkPlayerEnd() {
+        val deadline = System.currentTimeMillis() + 20_000
+        while (chunkPlayerRunning && !speechInterrupted &&
+            System.currentTimeMillis() < deadline
+        ) {
+            Thread.sleep(50)
+        }
+    }
+
     /**
-     * Итог потоковой сессии: озвучка wav с сервера (при стриме -- ждём
-     * конца очереди чанков, повторно НЕ озвучиваем) + переход в CONFIRM
-     * (streamConfirm с токеном) / окно дослушивания [openFollowUp] /
-     * WAKE (прерывание стоп-словом или ошибка).
+     * Итог потоковой сессии: финальная реплика звучит РОВНО ОДИН РАЗ.
+     * Три случая (З6 + фикс гонки двойной озвучки): (1) ответ не
+     * стримился -- speak(reply, audio); (2) ответ заменили при
+     * отправленных чанках (З6): финальный WAV погашен в очереди или не
+     * приходил -> speak(reply, audio), уже ВЗЯТ игроком -> ждём его
+     * конца, speak НЕ зовём; (3) чанки уже играли/играют без замены --
+     * повторно НЕ озвучиваем, ждём конца игрока. Далее -- переход в
+     * CONFIRM (streamConfirm с токеном) / окно дослушивания
+     * [openFollowUp] / WAKE (прерывание стоп-словом или ошибка).
      */
     private fun finishStreamReply() {
         val stream = voiceStream
@@ -1699,17 +1828,36 @@ class AssistantService : Service() {
             val reply = streamReply?.ifBlank { null } ?: "Готово"
             val audio = streamAudio
             AppLog.i(TAG, "stream reply: $reply (confirm=$streamConfirm " +
-                    "streamed=$streamStreamed)")
-            if (streamStreamed) {
+                    "streamed=$streamStreamed replaced=$streamReplaced)")
+            if (streamReplaced) {
+                // З6 (stop-chunks): сервер заменил reply при отправленных
+                // чанках. Детерминированная проверка «финал уже ВЗЯТ
+                // игроком»: финальный WAV -- последний enqueued-чанк
+                // (контракт З5: sentence+audio уходят ДО reply-события),
+                // его seq == chunkLastEnqSeq, и приходил он ТОЛЬКО если
+                // сервер успел синтезировать финал (streamed=true).
+                // Игрок пишет chunkPlayingSeq ПОД chunkLock вместе с
+                // выносом, поэтому совпадение seq здесь == «вынос случился
+                // до clear'а Reply-ветки» -- финал звучит/дозвучал
+                // серверным голосом, локальный speak задваивал бы его;
+                // несовпадение == clear погасил финал в очереди.
+                if (streamStreamed && chunkLastEnqSeq != 0 &&
+                    chunkPlayingSeq == chunkLastEnqSeq
+                ) {
+                    AppLog.i(TAG, "final wav taken by chunk player -- " +
+                            "skip local tts")
+                    awaitChunkPlayerEnd()
+                } else {
+                    // финал был в очереди и погашен clear'ом (либо не
+                    // приходил: streamed=false) -- скажет локальный TTS
+                    // ровно один раз
+                    speak(reply, audio)
+                }
+            } else if (streamStreamed) {
                 // чанки уже играли/играют (фаза 6) -- повторно НЕ
                 // озвучиваем (задвоение речи); ждём конца очереди игрока
                 // перед переходом в CONFIRM/follow-up
-                val deadline = System.currentTimeMillis() + 20_000
-                while (chunkPlayerRunning && !speechInterrupted &&
-                    System.currentTimeMillis() < deadline
-                ) {
-                    Thread.sleep(50)
-                }
+                awaitChunkPlayerEnd()
             } else {
                 speak(reply, audio)
             }
@@ -1944,7 +2092,7 @@ class AssistantService : Service() {
             synchronized(SPEAK_LOCK) {
                 try {
                     while (true) {
-                        val wav = synchronized(chunkLock) {
+                        val chunk = synchronized(chunkLock) {
                             while (chunkQueue.isEmpty() && !chunkStreamDone &&
                                 !speechInterrupted && running
                             ) {
@@ -1954,9 +2102,13 @@ class AssistantService : Service() {
                                 }
                             }
                             if (speechInterrupted || !running) null
+                            // seq взятого чанка фиксируем ПОД chunkLock
+                            // (атомарно относительно clear'а Reply-ветки)
+                            // и не сбрасываем после -- см. KDoc поля
                             else chunkQueue.removeFirstOrNull()
+                                ?.also { chunkPlayingSeq = it.seq }
                         } ?: break
-                        playChunkLocked(wav)
+                        playChunkLocked(chunk.wav)
                     }
                 } finally {
                     synchronized(chunkLock) {
