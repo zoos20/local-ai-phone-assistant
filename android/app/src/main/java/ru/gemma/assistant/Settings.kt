@@ -20,6 +20,8 @@ object Settings {
     private const val KEY_TUNNEL_HOST = "tunnel_host"
     private const val KEY_TUNNEL_PIN = "tunnel_pin"
     private const val KEY_PHONE_LOGS = "phone_logs"
+    private const val KEY_WAKE_DENOISE = "wake_denoise"
+    private const val KEY_HAL_NS = "hal_ns"
 
     /** Адрес сервера по умолчанию -- LAN-адрес ПК из README (свой замените). */
     const val DEFAULT_SERVER = "http://192.168.1.100:8090"
@@ -78,6 +80,41 @@ object Settings {
      */
     fun setPhoneLogs(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_PHONE_LOGS, enabled).commit()
+    }
+
+    /**
+     * Переключатель «Шумоподавление wake» (RNNoise-стейдж перед wake-словом).
+     * По умолчанию ВКЛЮЧЕН: цель фичи -- эксперимент в шуме, финальный
+     * дефолт решится по итогам живого смока. Читается и пишется независимо
+     * от блока подключения: save() его не затирает (там только строки
+     * подключения).
+     */
+    fun wakeDenoiseEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_WAKE_DENOISE, true)
+
+    /**
+     * Запись переключателя «Шумоподавление wake». commit() вместо apply():
+     * значение гарантированно оказывается на диске к моменту возврата --
+     * тот же паттерн, что у setPhoneLogs.
+     */
+    fun setWakeDenoise(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_WAKE_DENOISE, enabled).commit()
+    }
+
+    /**
+     * Переключатель «Системный NoiseSuppressor» (HAL-эффект Android).
+     * По умолчанию ВКЛЮЧЕН -- статус-кво: сегодня эффект создаётся всегда,
+     * флаг лишь позволяет его выключить, не меняя поведение молча.
+     */
+    fun halNoiseSuppressorEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_HAL_NS, true)
+
+    /**
+     * Запись переключателя «Системный NoiseSuppressor». commit() --
+     * тот же паттерн, что у setPhoneLogs.
+     */
+    fun setHalNoiseSuppressor(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_HAL_NS, enabled).commit()
     }
 
     /**

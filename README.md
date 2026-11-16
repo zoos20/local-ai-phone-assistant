@@ -144,11 +144,13 @@ Python-модули лежат плоско внутри `server/` (плоски
 
 ```powershell
 # Python (в server/, нужен dev-окружение: pip install -r requirements-dev.txt)
-.venv\Scripts\python.exe -m pytest -q      # 526 тестов
+.venv\Scripts\python.exe -m pytest -q      # 526 тестов (8 sidecar-тестов
+                                           # требуют .venv-tts -- без него
+                                           # они скипаются по skipif)
 .venv\Scripts\python.exe -m ruff check .   # линтер
 
 # Android (в android/)
-.\gradlew.bat testDebugUnitTest            # 243 юнит-теста
+.\gradlew.bat testDebugUnitTest            # 264 юнит-теста
 .\gradlew.bat assembleDebug
 ```
 
@@ -411,6 +413,13 @@ Kotlin-клиент (`android/`), foreground service с доступом к ми
 
 - распознаёт wake word офлайн через **Vosk** (модель встроена в APK и
   распаковывается при первом запуске),
+- перед wake-детектором прогоняет микрофонный аудио-стейдж
+  **RNNoise-деноизер** (чистый Kotlin-модуль `Denoise.kt`: ресемплер
+  16↔48 кГц, RNNoise-движок `rnnoise-kmp`, кольцевой буфер снапшотов для
+  verify) — замечает «Гемму» над шумом надёжнее; дополнительно системный
+  HAL `NoiseSuppressor` (оба переключателя — «RNNoise перед wake» и
+  «Системный NoiseSuppressor» — на экране «Настройки», по умолчанию
+  включены; NS работает только в фазе wake),
 - записывает речь и стримит её на сервер (`/ws_voice`), проигрывает ответ (WAV),
 - поддерживает Bluetooth-аудио и системную громкость озвучки,
 - экран: адрес сервера, DDNS-домен туннеля, токен API и пин сертификата —
@@ -434,6 +443,11 @@ Kotlin-клиент (`android/`), foreground service с доступом к ми
 выбирает транспорт), ручных переключателей нет.
 
 Сборка и установка (adb не обязан быть в PATH):
+
+Тулчейн: Kotlin **2.3.21**, AGP **8.13.0**, Gradle **8.13**,
+`compileSdk 37` + `compileSdkMinor 0` (targetSdk 34 / minSdk 26 не
+менялись); шумодав — зависимость `cn.enaium.rnnoise:rnnoise-kmp:1.0.2`
+(ради её AAR и подняли compileSdk до 37).
 
 ```powershell
 $env:JAVA_HOME = '<путь-к-jdk-17>'
@@ -488,8 +502,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-apk.ps1
 - сборка **debug** и подписана debug-ключом: поверх установленной сборки
   Android ставит только APK с тем же ключом подписи — если телефон и ПК
   собираются разными debug-ключами, установка поверх откажется;
-- текущая версия APK: **0.5** (versionCode 5);
-- APK ~69 МБ — внутрь встроена голосовая модель Vosk;
+- текущая версия APK: **0.6** (versionCode 6);
+- APK ~89 МБ — внутрь встроены голосовая модель Vosk и RNNoise-JNI
+  (`librnnoise_jni.so`, universal 4 ABI);
 - каталог `releases/` не попадает в git — это локальные артефакты ПК;
 - обновление работает только по LAN (см. выше), через туннель — нет;
 - `versionCode` обязан расти: приложение сравнивает `version_code` манифеста

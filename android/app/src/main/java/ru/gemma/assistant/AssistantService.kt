@@ -3,6 +3,7 @@ package ru.gemma.assistant
 import android.Manifest
 import android.app.Service
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.media.AudioAttributes
@@ -15,6 +16,7 @@ import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.IBinder
@@ -31,6 +33,7 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -261,6 +264,26 @@ class AssistantService : Service() {
         val ringBuf = ByteArray(WAKE_RING_MS * SAMPLE_RATE * 2 / 1000)
         var ringPos = 0
         var ringFilled = 0
+
+        // --- NS-стейдж перед wake (фича «RNNoise перед wake», З5) --------
+        // Второй (деноизированный) ring: кадры WAKE, прогнанные через
+        // RNNoise, пишутся сюда; verify при включённом стейдже читает
+        // снапшот ОТСЮДА (грамматика и verify слышат одно и то же
+        // обработанное аудио). Инстанс DenoiseRing (Denoise.kt) вместо
+        // копии полей ringPos/ringFilled -- класс уже инкапсулирует
+        // буфер/запись/снапшот/сброс (отклонение от чернового плана,
+        // зафиксировано в отчёте З5); тот же размер, что raw ring выше.
+        val denRing = DenoiseRing(WAKE_RING_MS * SAMPLE_RATE * 2 / 1000)
+        // Счётчики wake-стейджа (итоговая строка `wake stats` при
+        // остановке сервиса, З5): пишет и читает только аудио-поток --
+        // volatile не нужен.
+        var wakeHits = 0          // принятых wake word (после verify)
+        var verifyMatch = 0       // verify-эпизодов: MATCH
+        var verifyMismatch = 0    // verify-эпизодов: MISMATCH (reject)
+        var verifyEmpty = 0       // verify-эпизодов: EMPTY
+        var wakeDspFrames = 0     // кадров, обработанных стейджем успешно
+        var lastDspLogMs = 0L     // троттлинг строки `wake-dsp` (3 с,
+                                  // образец lastNoiseLogMs выше)
     }
 
     /** Единственный экземпляр состояния сессии (см. [SessionState]). */
@@ -299,6 +322,106 @@ class AssistantService : Service() {
     // сбросить состояние Vosk в аудио-потоке (сетевой поток не трогает
     // распознаватели -- Vosk не потокобезопасен)
     @Volatile private var needReset = false
+
+    // --- NS-стейдж перед wake (фича «RNNoise перед wake», З5) ----------
+    // Гейты из настроек; пишет слушатель prefs (переключение действует
+    // мгновенно, без рестарта сервиса -- условие A/B-смока), читает
+    // аудио-поток на каждый кадр WAKE (volatile: гонка безопасна,
+    // максимум один кадр в прежнем режиме).
+    @Volatile private var wakeDenoiseOn = true
+    @Volatile private var halNsOn = true
+    // Живой HAL NoiseSuppressor (создаёт аудио-поток): ссылку держим,
+    // чтобы слушатель prefs включал/выключал эффект на лету (setEnabled,
+    // без пересоздания AudioRecord). null -- не создан (hal_ns был off
+    // при старте аудио-цикла либо создание не удалось).
+    @Volatile private var halNs: NoiseSuppressor? = null
+    // Слушатель prefs «gemma» (имя продублировано: Settings.PREFS
+    // приватен, у PhoneLogChannel свой такой же). Сильная ссылка в поле
+    // обязательна: SharedPreferences держит слушателя СЛАБО -- без поля
+    // GC убрал бы его и переключатель перестал бы управлять флагами
+    // (паттерн PhoneLogChannel.kt). На ЛЮБОЕ изменение настроек
+    // перечитываем оба флага: строки ключей не дублируются, дрейф
+    // невозможен.
+    private val denoisePrefsListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            applyDenoiseFlags()
+        }
+
+    /**
+     * Перечитывает гейты NS-фичи из настроек (слушатель prefs вызывает на
+     * ЛЮБОЕ изменение) и логирует смену режима -- события в phone.log, по
+     * которым A/B-смок различает прогоны (З5). HAL-эффект переключается на
+     * лету, если он создан; иначе (не создан: hal_ns был off при старте
+     * цикла) -- только флаг, эффект подхватится после рестарта сервиса.
+     */
+    private fun applyDenoiseFlags() {
+        val den = try {
+            Settings.wakeDenoiseEnabled(this)
+        } catch (_: Throwable) {
+            wakeDenoiseOn
+        }
+        val ns = try {
+            Settings.halNoiseSuppressorEnabled(this)
+        } catch (_: Throwable) {
+            halNsOn
+        }
+        if (den != wakeDenoiseOn) {
+            wakeDenoiseOn = den
+            AppLog.i(TAG, if (den) "wake-denoise enabled" else "wake-denoise disabled")
+        }
+        if (ns != halNsOn) {
+            halNsOn = ns
+            AppLog.i(TAG, if (ns) "hal-ns enabled" else "hal-ns disabled")
+            try {
+                val fx = halNs
+                if (fx != null) {
+                    fx.enabled = ns
+                } else if (ns) {
+                    AppLog.i(TAG, "hal-ns: effect not created -- restart service to apply")
+                }
+            } catch (t: Throwable) {
+                AppLog.w(TAG, "hal-ns toggle failed", t)
+            }
+        }
+    }
+
+    /**
+     * Диагностика созданного HAL-эффекта (З5): enabled/hasControl/
+     * descriptor.name -- одного «NS enabled» на EMUI недостаточно
+     * (эффект может числиться включённым, но не иметь контроля).
+     */
+    private fun logFxState(name: String, fx: AudioEffect) {
+        val desc = try {
+            fx.descriptor
+        } catch (_: Throwable) {
+            null
+        }
+        // enabled/hasControl на «полуживом» эффекте тоже кидают
+        // IllegalStateException: диагностика не должна ронять создание
+        // следующего эффекта -- ловим, логируем W и продолжаем.
+        val enabled = try {
+            fx.enabled
+        } catch (_: Throwable) {
+            null
+        }
+        val hasControl = try {
+            fx.hasControl()
+        } catch (_: Throwable) {
+            null
+        }
+        if (enabled == null || hasControl == null) {
+            AppLog.w(
+                TAG, "$name state: query failed " +
+                        "(enabled=$enabled hasControl=$hasControl " +
+                        "desc=${desc?.name ?: "?"})"
+            )
+            return
+        }
+        AppLog.i(
+            TAG, "$name state: enabled=$enabled " +
+                    "hasControl=$hasControl desc=${desc?.name ?: "?"}"
+        )
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
@@ -420,6 +543,16 @@ class AssistantService : Service() {
         // Канал логов на ПК (задача 7): старт ПОСЛЕ токена -- гейт читает
         // переключатель «Логи на ПК» и поднимает фоновую отправку
         PhoneLogChannel.start(this)
+        // NS-фича (З5): начальные значения гейтов + слушатель prefs --
+        // переключатели «Шумоподавление wake»/«Системный NoiseSuppressor»
+        // действуют мгновенно, без рестарта сервиса (условие A/B-смока)
+        applyDenoiseFlags()
+        try {
+            getSharedPreferences("gemma", MODE_PRIVATE)
+                .registerOnSharedPreferenceChangeListener(denoisePrefsListener)
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "denoise prefs listener register failed", t)
+        }
         // BT-наушники: слушаем подключение/отключение и переключаем
         // микрофон (иначе ассистент через них не слышит)
         audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager
@@ -503,6 +636,13 @@ class AssistantService : Service() {
                         "Vosk не закрываем (утечка до смерти процесса)")
             }
             scope.cancel()
+            // NS-фича (З5): слушатель prefs гейтов снимается (тот же
+            // паттерн, что у канала логов ниже)
+            try {
+                getSharedPreferences("gemma", MODE_PRIVATE)
+                    .unregisterOnSharedPreferenceChangeListener(denoisePrefsListener)
+            } catch (_: Throwable) {
+            }
             // Канал логов (задача 7): слушатель prefs снимается, а СВОЯ
             // корутина отправки гасится в PhoneLogChannel.stop()
             // (flushJob.cancel()) -- scope.cancel() выше сервисный и к
@@ -568,6 +708,20 @@ class AssistantService : Service() {
         recorder = record
         applyBluetoothInput()
 
+        // Шаг-0 диагностика HAL-эффектов (З5): что устройство ОБЪЯВЛЯЕТ в
+        // AudioEffect.queryEffects() -- сегодня логируется только «NS
+        // enabled», чего на EMUI недостаточно (эффект может отсутствовать
+        // в списке, не иметь контроля или молча не работать)
+        try {
+            val fxList = AudioEffect.queryEffects()
+            AppLog.i(
+                TAG, "hal effects: query=${fxList.size} " +
+                        "ns=${fxList.any { it.type == AudioEffect.EFFECT_TYPE_NS }} " +
+                        "aec=${fxList.any { it.type == AudioEffect.EFFECT_TYPE_AEC }}"
+            )
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "hal effects query failed", t)
+        }
         // Эхоподавление: без него во время озвучки ответа микрофон слышит
         // динамик громче пользователя, и стоп-слово тонут в эхе (п. 11).
         // AEC гасит вывод динамика из сигнала микрофона; если устройство
@@ -577,16 +731,58 @@ class AssistantService : Service() {
                 AcousticEchoCanceler.create(record.audioSessionId)?.let {
                     it.enabled = true
                     AppLog.i(TAG, "AEC enabled")
+                    logFxState("AEC", it)
                 }
             }
+            // Гейт hal_ns (З5): дефолт true -- поведение прежнее (создаём
+            // и включаем, как раньше); false -- эффект не создаётся вовсе.
+            // Ссылка в halNs -- слушатель prefs переключает эффект на лету
             if (NoiseSuppressor.isAvailable()) {
-                NoiseSuppressor.create(record.audioSessionId)?.let {
-                    it.enabled = true
-                    AppLog.i(TAG, "NS enabled")
+                if (halNsOn) {
+                    NoiseSuppressor.create(record.audioSessionId)?.let { nsFx ->
+                        halNs = nsFx
+                        nsFx.enabled = true
+                        AppLog.i(TAG, "NS enabled")
+                        logFxState("NS", nsFx)
+                    }
+                } else {
+                    AppLog.i(TAG, "NS skipped (hal-ns off)")
                 }
             }
         } catch (t: Throwable) {
             AppLog.w(TAG, "AEC/NS setup failed", t)
+        }
+
+        // --- NS-стейдж перед wake (З5): ОДИН инстанс RNNoise на жизнь
+        // аудио-цикла (переиспользуемый); reset() -- при смене флага и на
+        // входе в WAKE (state-gap оценки шума RNNoise безвреден, reset --
+        // гигиена; см. KDoc WakeDenoiser.reset). Отказ создания не роняет
+        // аудио-цикл: стейдж остаётся выключенным (путь NS=off) до
+        // рестарта сервиса.
+        val denoiser: WakeDenoiser? = try {
+            WakeDenoiser.create()
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "wake-dsp init failed -- stage disabled", t)
+            null
+        }
+        // После отказа стейджа (создание/JNI/кадр) -- путь NS=off до
+        // рестарта сервиса: feedRecognizer получает сырые кадры, verify --
+        // сырой ring. Отдельная переменная (не просто !wakeDenoiseOn):
+        // фолбэк «застревает», даже если флаг вернуть в true до рестарта.
+        var dspFailed = denoiser == null
+        // Значение флага, уже применённое к стейджу (сброс состояния -- при
+        // смене режима; само событие логирует слушатель prefs)
+        var dspApplied = wakeDenoiseOn
+        // Аккумуляторы окна телеметрии `wake-dsp` (сбрасываются строкой,
+        // ≤1 строки/3 с)
+        var dspWindowFrames = 0
+        var dspProcNs = 0L
+        var dspProcMaxNs = 0L
+        if (denoiser != null) {
+            AppLog.i(
+                TAG, "wake-dsp: stage created" +
+                        if (wakeDenoiseOn) " (enabled)" else " (flag off)"
+            )
         }
 
         updateNotification("Слушаю «Гемма»…")
@@ -663,7 +859,47 @@ class AssistantService : Service() {
         // --- слушаем wake word ---------------------------------
         fun handleWake(frame: ByteArray, n: Int): Boolean {
             ringWrite(frame, n)
-            val text = feedRecognizer(wakeRecognizer, frame, n) ?: return false
+            // --- З5: NS-стейдж (только WAKE, только при живом стейдже) --
+            // Сырой кадр ВСЕГДА в raw ring (строкой выше): RMS-гейт,
+            // prelude и verify при NS off меряют СЫРОЙ сигнал (§7 не
+            // трогается). Деноизированный кадр идёт в wakeRecognizer и
+            // denRing (источник verify при NS on). ЛЮБОЕ исключение
+            // стейджа (JNI/ресемплинг/память) -> фолбэк на сырую подачу
+            // кадра + ОДНА строка W; после отказа путь NS=off до рестарта
+            // сервиса, audioLoop не роняется.
+            var dspFrame: ByteArray? = null
+            var dspLen = 0
+            var dspProb = 0f
+            var dspDenRms = 0
+            if (wakeDenoiseOn && !dspFailed) {
+                val den = denoiser
+                if (den != null) {
+                    try {
+                        val t0 = System.nanoTime()
+                        dspFrame = den.process(frame, n)
+                        dspLen = den.lastFrameBytes
+                        val dtNs = System.nanoTime() - t0
+                        dspProcNs += dtNs
+                        if (dtNs > dspProcMaxNs) dspProcMaxNs = dtNs
+                        dspWindowFrames++
+                        session.wakeDspFrames++
+                        dspProb = den.lastSpeechProb
+                        dspDenRms = pcmRms(dspFrame, dspLen)
+                        session.denRing.write(dspFrame, dspLen)
+                    } catch (t: Throwable) {
+                        dspFailed = true
+                        dspFrame = null
+                        // мёртвые деноизированные данные после фолбэка не должны попасть в verify
+                        session.denRing.clear()
+                        AppLog.w(TAG, "wake-dsp failed, fallback to raw", t)
+                    }
+                }
+            }
+            // подача в wake-распознаватель: деноизированный кадр (NS on)
+            // либо сырой (NS off / фолбэк) -- как раньше
+            val feedFrame = dspFrame ?: frame
+            val feedLen = if (dspFrame != null) dspLen else n
+            val text = feedRecognizer(wakeRecognizer, feedFrame, feedLen) ?: return false
             // что Vosk реально слышит (для диагностики «не реагирует»)
             val now = System.currentTimeMillis()
             if (text.isNotBlank() && now - session.lastWakeLogMs > 700) {
@@ -675,6 +911,26 @@ class AssistantService : Service() {
             if (now - session.lastNoiseLogMs > 3000) {
                 session.lastNoiseLogMs = now
                 AppLog.i(TAG, "wake-rms=$rms")
+            }
+            // Телеметрия стейджа (З5): ≤1 строки/3 с (образец wake-rms
+            // выше); ТОЛЬКО при живом стейдже -- при NS=off логи прежние
+            // байт-в-байт. A/B-прогоны различаются однозначно: строки
+            // `wake-dsp: ns=on ...` есть только в режиме NS=on.
+            if (dspFrame != null && now - session.lastDspLogMs > 3000) {
+                session.lastDspLogMs = now
+                val avgMs = if (dspWindowFrames > 0) {
+                    dspProcNs.toDouble() / dspWindowFrames / 1e6
+                } else 0.0
+                AppLog.i(
+                    TAG, "wake-dsp: ns=on rmsRaw=$rms rmsDenoised=$dspDenRms " +
+                            "prob=" + String.format(Locale.US, "%.2f", dspProb) +
+                            " frameOk=$dspWindowFrames " +
+                            "procAvg=" + String.format(Locale.US, "%.1f", avgMs) + "ms " +
+                            "procMax=" + String.format(Locale.US, "%.1f", dspProcMaxNs / 1e6) + "ms"
+                )
+                dspWindowFrames = 0
+                dspProcNs = 0
+                dspProcMaxNs = 0
             }
             if (isWakeTrigger(text)) {
                 // ступень 2: энергия (отсекает очевидный шум).
@@ -710,7 +966,16 @@ class AssistantService : Service() {
                 // ударов в секунду, каждый verify -- дороже кадра
                 if (now - session.lastVerifyMs < VERIFY_MIN_GAP_MS) return false
                 session.lastVerifyMs = now
-                val snapshot = ringSnapshot()
+                // З5: источник снапшота verify. При живом стейдже --
+                // деноизированный ring (грамматика и verify слышат ОДНО и
+                // то же обработанное аудио; «фильтровать окно verify на
+                // лету» нельзя -- NS-инстанс стейтфул, это ~300+ мс CPU
+                // синхронно в аудио-потоке и ломка стейта). NS off /
+                // после фолбэка -- сырой ring как раньше: denRing при
+                // выключенной фиче пуст, читать его нельзя.
+                val snapshot =
+                    if (wakeDenoiseOn && !dspFailed) session.denRing.snapshot()
+                    else ringSnapshot()
                 // ДВА шага (см. VERIFY_SHORT_TAIL_MS / VERIFY_TAIL_MS):
                 // 1) короткий хвост 1.2 с -- свежая «Гемма» у правого
                 //    края буфера, фон из середины окна не мешает;
@@ -758,11 +1023,13 @@ class AssistantService : Service() {
                         // содержимое есть в ОБОИХ окнах, но это не
                         // «гемма» -- reject
                         AppLog.i(TAG, "wake rejected (verify failed)")
+                        session.verifyMismatch++
                         session.verifyRetryDeadlineMs = 0L
                         try { wakeRecognizer?.reset() } catch (_: Exception) {}
                         return false
                     }
                     VerifyResult.EMPTY -> {
+                        session.verifyEmpty++
                         // Живой тест 31.10 «часто начинает слушать,
                         // когда не зову»: свежий удар + EMPTY раньше
                         // принимался как weak MATCH БЕЗ проверки -- так
@@ -791,9 +1058,13 @@ class AssistantService : Service() {
                         }
                         return false
                     }
-                    VerifyResult.MATCH -> { session.verifyRetryDeadlineMs = 0L }
+                    VerifyResult.MATCH -> {
+                        session.verifyMatch++
+                        session.verifyRetryDeadlineMs = 0L
+                    }
                 }
                 AppLog.i(TAG, "wake word hit: '$text'")
+                session.wakeHits++
                 try {
                     wakeRecognizer?.reset()
                     recognizer?.reset()
@@ -1274,84 +1545,130 @@ class AssistantService : Service() {
             return true
         }
 
-        while (running) {
-            val n = record.read(frame, 0, frame.size)
-            if (n <= 0) continue
-
-            if (needReset) {
-                // сетевой поток попросил сбросить состояние Vosk (иначе
-                // старый текст из прошлой команды даёт ложные срабатывания)
-                needReset = false
-                try {
-                    recognizer?.reset()
-                    wakeRecognizer?.reset()
-                } catch (_: Exception) {
-                }
-            }
-
-            // переход в состояние ожидания подтверждения -- стартуем
-            // окно прямого слушания «да/отмена» БЕЗ wake word (фаза 4)
-            if (session.state != session.lastState) {
-                if (session.state == State.CONFIRM) {
-                    session.confirmDeadlineMs = System.currentTimeMillis() + CONFIRM_MS
-                    session.confirmSpeechMs = 0
-                    session.lastConfirmHearLogMs = 0L
-                    // Сброс устаревшего токена (баг 28.10: «время ответа
-                    // истекло»). confirmToken -- локальная переменная цикла
-                    // и переживает doConfirm: старый съеденный токен не
-                    // давал подхватить новый из pendingToken (условие
-                    // «== null» ложно), а запись в pendingToken перетирала
-                    // свежий токен. На входе в CONFIRM -- всегда чисто:
-                    // processCommand кладёт токен ДО смены состояния.
-                    session.confirmToken = null
-                    AppLog.i(TAG, "confirm window: ${CONFIRM_MS} ms (direct, no wake)")
-                }
-                if (session.state == State.FOLLOWUP) {
-                    // вход в окно дослушивания (открыл openFollowUp):
-                    // счётчики речи -- начисто
-                    session.followupSpeechMs = 0
-                    session.followupAnySpeech = false
-                    // ring-буфер очищаем: в нём хвост ТОЛЬКО ЧТО
-                    // озвученного ответа (эхо), prelude из него унёс бы
-                    // слова Геммы в whisper как «речь пользователя»
-                    session.ringPos = 0
-                    session.ringFilled = 0
-                }
-                if (session.state == State.SPEAKING && session.lastState != State.SPEAKING) {
-                    // вход в озвучку: ставим дедлайн (A2) -- при обрыве
-                    // без reply выведем из SPEAKING сами
-                    session.speakDeadlineMs = System.currentTimeMillis()
-                }
-                session.lastState = session.state
-            }
-
-            when (session.state) {
-                State.STOPPED -> break
-
-                State.WAKE -> if (!handleWake(frame, n)) continue
-
-                State.COMMAND -> if (!handleCommand(frame, n)) continue
-
-                State.SPEAKING -> if (!handleSpeaking(frame, n)) continue
-
-                State.CONFIRM -> if (!handleConfirm(frame, n)) continue
-
-                State.FOLLOWUP -> if (!handleFollowup(frame, n)) continue
-            }
-
-            // processCommand кладёт токен, а цикл CONFIRM должен его увидеть
-            if (session.state == State.CONFIRM && session.confirmToken == null) {
-                session.confirmToken = pendingToken.get()
-            }
-        }
-
+        // Тело цикла может бросить (хендлеры/стейдж): teardown в finally
+        // ниже -- чтобы нативные ресурсы закрывались и на аварийном пути.
         try {
-            record.stop()
-        } catch (_: Exception) {
+            while (running) {
+                val n = record.read(frame, 0, frame.size)
+                if (n <= 0) continue
+
+                if (needReset) {
+                    // сетевой поток попросил сбросить состояние Vosk (иначе
+                    // старый текст из прошлой команды даёт ложные срабатывания)
+                    needReset = false
+                    try {
+                        recognizer?.reset()
+                        wakeRecognizer?.reset()
+                    } catch (_: Exception) {
+                    }
+                }
+
+                // З5: смена режима NS-стейджа на лету (событие уже залогировал
+                // слушатель prefs) -- сбрасываем состояние стейджа и
+                // деноизированного ring: накопленное относится к прежнему
+                // режиму, следующий удар грамматики -- уже в новом режиме
+                if (dspApplied != wakeDenoiseOn) {
+                    dspApplied = wakeDenoiseOn
+                    denoiser?.reset()
+                    session.denRing.clear()
+                }
+
+                // переход в состояние ожидания подтверждения -- стартуем
+                // окно прямого слушания «да/отмена» БЕЗ wake word (фаза 4)
+                if (session.state != session.lastState) {
+                    if (session.state == State.CONFIRM) {
+                        session.confirmDeadlineMs = System.currentTimeMillis() + CONFIRM_MS
+                        session.confirmSpeechMs = 0
+                        session.lastConfirmHearLogMs = 0L
+                        // Сброс устаревшего токена (баг 28.10: «время ответа
+                        // истекло»). confirmToken -- локальная переменная цикла
+                        // и переживает doConfirm: старый съеденный токен не
+                        // давал подхватить новый из pendingToken (условие
+                        // «== null» ложно), а запись в pendingToken перетирала
+                        // свежий токен. На входе в CONFIRM -- всегда чисто:
+                        // processCommand кладёт токен ДО смены состояния.
+                        session.confirmToken = null
+                        AppLog.i(TAG, "confirm window: ${CONFIRM_MS} ms (direct, no wake)")
+                    }
+                    if (session.state == State.FOLLOWUP) {
+                        // вход в окно дослушивания (открыл openFollowUp):
+                        // счётчики речи -- начисто
+                        session.followupSpeechMs = 0
+                        session.followupAnySpeech = false
+                        // ring-буфер очищаем: в нём хвост ТОЛЬКО ЧТО
+                        // озвученного ответа (эхо), prelude из него унёс бы
+                        // слова Геммы в whisper как «речь пользователя»
+                        session.ringPos = 0
+                        session.ringFilled = 0
+                    }
+                    if (session.state == State.WAKE) {
+                        // З5: гигиена стейджа на входе в WAKE. denRing в
+                        // COMMAND/SPEAKING/CONFIRM/FOLLOWUP не пишется (NS
+                        // гоняется ТОЛЬКО в WAKE -- батарея), поэтому без
+                        // очистки verify после возврата в WAKE слышал бы
+                        // УСТАРЕВШУЮ «Гемму» с предыдущего удара (false MATCH
+                        // на случайном ударе грамматики). reset стейджа --
+                        // FIR-история с чистого листа (state-gap RNNoise
+                        // безвреден, reset -- гигиена).
+                        denoiser?.reset()
+                        session.denRing.clear()
+                    }
+                    if (session.state == State.SPEAKING && session.lastState != State.SPEAKING) {
+                        // вход в озвучку: ставим дедлайн (A2) -- при обрыве
+                        // без reply выведем из SPEAKING сами
+                        session.speakDeadlineMs = System.currentTimeMillis()
+                    }
+                    session.lastState = session.state
+                }
+
+                when (session.state) {
+                    State.STOPPED -> break
+
+                    State.WAKE -> if (!handleWake(frame, n)) continue
+
+                    State.COMMAND -> if (!handleCommand(frame, n)) continue
+
+                    State.SPEAKING -> if (!handleSpeaking(frame, n)) continue
+
+                    State.CONFIRM -> if (!handleConfirm(frame, n)) continue
+
+                    State.FOLLOWUP -> if (!handleFollowup(frame, n)) continue
+                }
+
+                // processCommand кладёт токен, а цикл CONFIRM должен его увидеть
+                if (session.state == State.CONFIRM && session.confirmToken == null) {
+                    session.confirmToken = pendingToken.get()
+                }
+            }
+        } finally {
+            try {
+                record.stop()
+            } catch (_: Exception) {
+            }
+            recorder = null
+            record.release()
+            // З5: итог wake-стейджа за жизнь сервиса (счётчики SessionState)
+            // -- пишется один раз на любом пути (нормальном и аварийном)
+            AppLog.i(
+                TAG, "wake stats: hits=${session.wakeHits} " +
+                        "verifyMatch=${session.verifyMatch} " +
+                        "mismatch=${session.verifyMismatch} " +
+                        "empty=${session.verifyEmpty} " +
+                        "frames=${session.wakeDspFrames}"
+            )
+            // Нативный RNNoise освобождает владелец -- аудио-цикл (KDoc
+            // WakeDenoiser.close); HAL-эффект, если создавался, -- тоже здесь
+            try {
+                denoiser?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                halNs?.release()
+            } catch (_: Throwable) {
+            }
+            halNs = null
+            AppLog.i(TAG, "audio loop stopped")
         }
-        recorder = null
-        record.release()
-        AppLog.i(TAG, "audio loop stopped")
     }
 
     /**

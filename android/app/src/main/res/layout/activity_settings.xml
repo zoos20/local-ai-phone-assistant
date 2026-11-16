@@ -166,6 +166,56 @@
                 android:contentDescription="Логи на ПК"
                 android:minHeight="48dp" />
         </LinearLayout>
+
+        <!-- Шумоподавление wake (Settings.wake_denoise, дефолт ВКЛ) и
+             системный NoiseSuppressor (Settings.hal_ns, дефолт ВКЛ):
+             те же строки-переключатели, что у «Логи на ПК» — пишутся
+             сразу при переключении, не ждут «Сохранить» -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Шумоподавление wake"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchWakeDenoise"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Шумоподавление wake"
+                android:minHeight="48dp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Системный NoiseSuppressor"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchHalNs"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Системный NoiseSuppressor"
+                android:minHeight="48dp" />
+        </LinearLayout>
     </LinearLayout>
 
     <!-- Действия: проверка связи до сохранения и сохранение -->

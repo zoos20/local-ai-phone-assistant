@@ -46,6 +46,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var btnUpdate: Button
     private lateinit var progressUpdate: ProgressBar
     private lateinit var switchPhoneLogs: MaterialSwitch
+    private lateinit var switchWakeDenoise: MaterialSwitch
+    private lateinit var switchHalNs: MaterialSwitch
     private val uiHandler = Handler(Looper.getMainLooper())
 
     /** Машина состояний карточки «Обновление» — ровно 7 (рендер в setUpdateState). */
@@ -96,6 +98,8 @@ class SettingsActivity : AppCompatActivity() {
         btnUpdate = findViewById(R.id.btnUpdate)
         progressUpdate = findViewById(R.id.progressUpdate)
         switchPhoneLogs = findViewById(R.id.switchPhoneLogs)
+        switchWakeDenoise = findViewById(R.id.switchWakeDenoise)
+        switchHalNs = findViewById(R.id.switchHalNs)
 
         // Подпись версии карточки «Обновление» (PackageInfo, не BuildConfig)
         val (vName, vCode) = packageVersion()
@@ -126,6 +130,19 @@ class SettingsActivity : AppCompatActivity() {
         switchPhoneLogs.isChecked = Settings.phoneLogsEnabled(this)
         switchPhoneLogs.setOnCheckedChangeListener { _, checked ->
             Settings.setPhoneLogs(this, checked)
+        }
+
+        // «Шумоподавление wake» / «Системный NoiseSuppressor»: тот же
+        // паттерн, что у «Логи на ПК» -- значение читается из хранилища и
+        // пишется сразу при переключении; до аудио-потока доходит через
+        // слушатель prefs в AssistantService (без перезапуска)
+        switchWakeDenoise.isChecked = Settings.wakeDenoiseEnabled(this)
+        switchWakeDenoise.setOnCheckedChangeListener { _, checked ->
+            Settings.setWakeDenoise(this, checked)
+        }
+        switchHalNs.isChecked = Settings.halNoiseSuppressorEnabled(this)
+        switchHalNs.setOnCheckedChangeListener { _, checked ->
+            Settings.setHalNoiseSuppressor(this, checked)
         }
 
         // Стартовое состояние карточки «Обновление»: keepStatus=true --
